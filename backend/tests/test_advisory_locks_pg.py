@@ -7,17 +7,20 @@ when running against SQLite (advisory locks are not supported there).
 
 Run with:
     TEST_DATABASE_URL=postgresql://scheduler:scheduler@localhost:5432/scheduler_test \
-      python -m pytest tests/test_advisory_locks_pg.py -v
+      python -m pytest tests/test_advisory_locks_pg.py -v -s
 """
 
 import os
+import time
 import pytest
 import threading
+import logging
 from datetime import datetime, timedelta, timezone
 
 from app.services.appointment_service import AppointmentService
 from app.exceptions import ResourceUnavailableError
 
+logger = logging.getLogger(__name__)
 
 # Skip the entire module when not running against PostgreSQL
 pytestmark = pytest.mark.skipif(
@@ -44,6 +47,8 @@ class TestAdvisoryLocks:
         svc = AppointmentService()
         start = _tomorrow_14()
 
+        logger.info("[SEQ] Booking slot: technician=%s start=%s", technician.id, start.isoformat())
+
         appt1 = svc.create_appointment(
             customer_id=customer.id,
             vehicle_id=vehicle.id,
@@ -52,7 +57,8 @@ class TestAdvisoryLocks:
             desired_start=start,
             technician_id=technician.id,
         )
-        assert appt1.status == "CONFIRMED"
+        logger.info("[SEQ] Booking 1 → id=%s status=%s expires_at=%s", appt1.id, appt1.status, appt1.expires_at)
+        assert appt1.status == "PENDING"
 
         from app.models.customer import Customer as CM
         from app.models.vehicle import Vehicle as VM
@@ -65,7 +71,8 @@ class TestAdvisoryLocks:
         db.session.add(v2)
         db.session.flush()
 
-        with pytest.raises(ResourceUnavailableError):
+        logger.info("[SEQ] Booking 2 — same slot, expecting ResourceUnavailableError ...")
+        with pytest.raises(ResourceUnavailableError) as exc_info:
             svc.create_appointment(
                 customer_id=c2.id,
                 vehicle_id=v2.id,
@@ -74,6 +81,12 @@ class TestAdvisoryLocks:
                 desired_start=start,
                 technician_id=technician.id,
             )
+        next_slot = exc_info.value.next_available_slot
+        logger.info(
+            "[SEQ] Booking 2 raised as expected: %s | next_available_slot=%s",
+            exc_info.value.message,
+            next_slot.isoformat() if next_slot else "None",
+        )
 
     def test_advisory_lock_key_is_postgresql_hashtext(self, db, app):
         """
@@ -81,9 +94,11 @@ class TestAdvisoryLocks:
         returns without error. This confirms the PostgreSQL function is available.
         """
         from sqlalchemy import text
+        key = "test:key:2026-03-20"
         result = db.session.execute(
-            text("SELECT hashtext('test:key:2026-03-20')")
+            text("SELECT hashtext(:k)"), {"k": key}
         ).scalar()
+        logger.info("[LOCK] hashtext('%s') = %s", key, result)
         assert isinstance(result, int)
 
     def test_concurrent_booking_one_succeeds(
@@ -91,7 +106,7 @@ class TestAdvisoryLocks:
     ):
         """
         Two threads race to book the same slot+technician.
-        Exactly one must succeed (CONFIRMED); the other must raise ResourceUnavailableError.
+        Exactly one must succeed (PENDING hold); the other must raise ResourceUnavailableError.
 
         NOTE: This test is intentionally slow (~1-2s) because it exercises real
         PostgreSQL advisory lock serialisation with two application threads.
@@ -99,12 +114,16 @@ class TestAdvisoryLocks:
         from app.models.customer import Customer as CM
         from app.models.vehicle import Vehicle as VM
 
-        start = _tomorrow_14(offset_minutes=30)  # use different time to not conflict with other tests
+        start = _tomorrow_14(offset_minutes=30)
+        logger.info("[CONC] Racing 2 threads for slot: technician=%s start=%s", technician.id, start.isoformat())
 
         results = []
-        errors = []
+        errors  = []
+        timings = {}
 
-        def book(cust_id, veh_id):
+        def book(label, cust_id, veh_id):
+            t0 = time.perf_counter()
+            logger.info("[CONC][%s] thread started — customer=%s vehicle=%s", label, cust_id, veh_id)
             with app.app_context():
                 svc = AppointmentService()
                 try:
@@ -116,13 +135,30 @@ class TestAdvisoryLocks:
                         desired_start=start,
                         technician_id=technician.id,
                     )
+                    elapsed = time.perf_counter() - t0
+                    timings[label] = elapsed
+                    logger.info(
+                        "[CONC][%s] PENDING hold id=%s expires_at=%s (%.3fs)",
+                        label, appt.id, appt.expires_at, elapsed,
+                    )
                     results.append(("ok", appt.id))
                 except ResourceUnavailableError as e:
-                    results.append(("fail", str(e)))
+                    elapsed = time.perf_counter() - t0
+                    timings[label] = elapsed
+                    next_slot = e.next_available_slot
+                    logger.info(
+                        "[CONC][%s] ResourceUnavailableError: %s | next_slot=%s (%.3fs)",
+                        label, e.message,
+                        next_slot.isoformat() if next_slot else "None",
+                        elapsed,
+                    )
+                    results.append(("fail", str(e.message)))
                 except Exception as e:
+                    elapsed = time.perf_counter() - t0
+                    logger.error("[CONC][%s] Unexpected %s: %s (%.3fs)", label, type(e).__name__, e, elapsed)
                     errors.append(e)
 
-        # Create second customer+vehicle in the main session first
+        # Create second customer+vehicle before spawning threads
         with app.app_context():
             from app.extensions import db as _db2
             c2 = CM(first_name="A", last_name="B", email="ab@test.com",
@@ -134,17 +170,21 @@ class TestAdvisoryLocks:
             _db2.session.add(v2)
             _db2.session.commit()
             c2_id, v2_id = c2.id, v2.id
+            logger.info("[CONC] Created c2=%s v2=%s", c2_id, v2_id)
 
-        t1 = threading.Thread(target=book, args=(customer.id, vehicle.id))
-        t2 = threading.Thread(target=book, args=(c2_id, v2_id))
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
+        t1 = threading.Thread(target=book, args=("T1", customer.id, vehicle.id))
+        t2 = threading.Thread(target=book, args=("T2", c2_id,       v2_id))
+
+        race_start = time.perf_counter()
+        t1.start(); t2.start()
+        t1.join();  t2.join()
+        total = time.perf_counter() - race_start
+        logger.info("[CONC] Race finished in %.3fs — results: %s", total, results)
 
         assert not errors, f"Unexpected exceptions: {errors}"
         assert len(results) == 2
         successes = [r for r in results if r[0] == "ok"]
         failures  = [r for r in results if r[0] == "fail"]
+        logger.info("[CONC] successes=%s failures=%s", successes, failures)
         assert len(successes) == 1, f"Expected exactly 1 success, got: {results}"
-        assert len(failures)  == 1, f"Expected exactly 1 failure, got: {results}"
+        assert len(failures)  == 1, f"Expected exactly 1 failure,  got: {results}"

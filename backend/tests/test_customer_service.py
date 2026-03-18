@@ -38,7 +38,7 @@ class TestCustomerService:
         with app.app_context():
             svc = CustomerService()
             with pytest.raises(NotFoundError):
-                svc.get_by_id("00000000-0000-0000-0000-000000000000")
+                svc.get_by_id(999999)
 
     def test_search_by_phone(self, db, app, customer):
         with app.app_context():
@@ -69,7 +69,7 @@ class TestVehicleService:
             result = svc.get_by_identifier("1HGCM82633A123456")
             assert result.id == vehicle.id
 
-    def test_get_by_uuid(self, db, app, vehicle):
+    def test_get_by_id(self, db, app, vehicle):
         with app.app_context():
             from app.services.vehicle_service import VehicleService
             svc = VehicleService()
@@ -82,7 +82,7 @@ class TestVehicleService:
             from app.exceptions import ValidationError
             svc = VehicleService()
             with pytest.raises(ValidationError):
-                svc.get_by_identifier("not-a-vin-or-uuid")
+                svc.get_by_identifier("not-a-valid-identifier")
 
     def test_create_vehicle_duplicate_vin_raises(self, db, app, customer, vehicle):
         with app.app_context():

@@ -2,7 +2,7 @@ from marshmallow import Schema, fields, EXCLUDE
 
 
 class TechnicianSchema(Schema):
-    id              = fields.Str(dump_only=True)
+    id              = fields.Int(dump_only=True)
     first_name      = fields.Str()
     last_name       = fields.Str()
     name            = fields.Method("get_full_name")

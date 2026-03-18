@@ -1,9 +1,31 @@
 from __future__ import annotations
-from datetime import datetime
-from sqlalchemy import text
+from datetime import datetime, timedelta, timezone
+from sqlalchemy import text, func
 from flask import current_app
 from app.extensions import db
 from app.models.appointment import Appointment, AppointmentStatus
+
+PENDING_TTL_MINUTES = 10
+
+
+def _active_hold_filter():
+    """
+    SQLAlchemy filter expression for appointments that currently block a slot:
+      - CONFIRMED (no expiry)
+      - PENDING where expires_at > NOW() (unexpired hold)
+
+    EXPIRED, CANCELLED, COMPLETED rows are excluded — their resources are free.
+    """
+    return db.and_(
+        Appointment.status.in_([
+            AppointmentStatus.CONFIRMED.value,
+            AppointmentStatus.PENDING.value,
+        ]),
+        db.or_(
+            Appointment.expires_at.is_(None),
+            Appointment.expires_at > func.now(),
+        ),
+    )
 
 
 class AppointmentRepository:
@@ -12,13 +34,15 @@ class AppointmentRepository:
 
     def load_booked_intervals(
         self, dealership_id: str, range_start: datetime, range_end: datetime
-    ) -> dict:
+    ) -> tuple[dict, dict]:
         """
         Query 1 of the batch calendar load.
 
-        Returns a dict mapping resource_id → [(scheduled_start, scheduled_end), ...].
-        Uses the overlap filter (not a simple range filter) to correctly capture
-        appointments that started before range_start but extend into the range.
+        Returns (tech_booked, bay_booked) — two separate dicts each mapping
+        resource_id → [(scheduled_start, scheduled_end), ...].
+
+        Kept in separate namespaces to avoid collisions when a technician and a
+        service bay share the same integer primary key.
         """
         rows = db.session.execute(
             db.select(
@@ -28,7 +52,7 @@ class AppointmentRepository:
                 Appointment.scheduled_end,
             ).where(
                 Appointment.dealership_id == dealership_id,
-                Appointment.status == AppointmentStatus.CONFIRMED.value,
+                _active_hold_filter(),
                 # Overlap filter: NOT (end <= range_start OR start >= range_end)
                 ~db.or_(
                     Appointment.scheduled_end <= range_start,
@@ -37,13 +61,51 @@ class AppointmentRepository:
             )
         ).all()
 
-        result: dict = {}
+        tech_booked: dict = {}
+        bay_booked: dict = {}
         for tech_id, bay_id, start, end in rows:
             if tech_id:
-                result.setdefault(tech_id, []).append((start, end))
+                tech_booked.setdefault(tech_id, []).append((start, end))
             if bay_id:
-                result.setdefault(bay_id, []).append((start, end))
-        return result
+                bay_booked.setdefault(bay_id, []).append((start, end))
+        return tech_booked, bay_booked
+
+    def get_latest_by_vehicle_ids(self, vehicle_ids: list) -> dict:
+        """
+        Batch-fetch the most recent non-cancelled appointment for each vehicle.
+
+        Returns a dict mapping vehicle_id → Appointment (latest scheduled_start).
+        Vehicles with no appointments are omitted from the result.
+        """
+        if not vehicle_ids:
+            return {}
+
+        latest_subq = (
+            db.select(
+                Appointment.vehicle_id,
+                func.max(Appointment.scheduled_start).label("max_start"),
+            )
+            .where(
+                Appointment.vehicle_id.in_(vehicle_ids),
+                Appointment.status != AppointmentStatus.CANCELLED.value,
+            )
+            .group_by(Appointment.vehicle_id)
+            .subquery()
+        )
+
+        rows = db.session.execute(
+            db.select(Appointment)
+            .join(
+                latest_subq,
+                db.and_(
+                    Appointment.vehicle_id == latest_subq.c.vehicle_id,
+                    Appointment.scheduled_start == latest_subq.c.max_start,
+                ),
+            )
+            .where(Appointment.status != AppointmentStatus.CANCELLED.value)
+        ).scalars().all()
+
+        return {appt.vehicle_id: appt for appt in rows}
 
     def acquire_locks(
         self,
@@ -75,11 +137,15 @@ class AppointmentRepository:
         booked_by_customer_id: str | None = None,
     ) -> Appointment:
         """
-        Step 2 of atomic booking: INSERT after locks are held and re-check has passed.
+        Step 2 of atomic booking: INSERT a PENDING hold after locks are held and
+        re-check has passed.
 
-        Caller is responsible for calling acquire_locks() and validate_no_overlap()
-        BEFORE calling this method. Do NOT flush here — caller commits the transaction.
+        expires_at is set to now + PENDING_TTL_MINUTES. The advisor must call
+        confirm() within the TTL to transition to CONFIRMED.
         """
+        now_utc    = datetime.now(timezone.utc).replace(tzinfo=None)
+        expires_at = now_utc + timedelta(minutes=PENDING_TTL_MINUTES)
+
         appointment = Appointment(
             customer_id=customer_id,
             booked_by_customer_id=booked_by_customer_id or customer_id,
@@ -91,9 +157,24 @@ class AppointmentRepository:
             scheduled_start=scheduled_start,
             scheduled_end=scheduled_end,
             notes=notes,
-            status=AppointmentStatus.CONFIRMED.value,
+            status=AppointmentStatus.PENDING.value,
+            expires_at=expires_at,
         )
         db.session.add(appointment)
+        db.session.flush()
+        return appointment
+
+    def confirm(self, appointment: Appointment) -> Appointment:
+        """Transition PENDING → CONFIRMED. Caller must validate expiry first."""
+        appointment.status     = AppointmentStatus.CONFIRMED.value
+        appointment.expires_at = None
+        db.session.flush()
+        return appointment
+
+    def cancel(self, appointment: Appointment) -> Appointment:
+        """Transition PENDING or CONFIRMED → CANCELLED."""
+        appointment.status     = AppointmentStatus.CANCELLED.value
+        appointment.expires_at = None
         db.session.flush()
         return appointment
 

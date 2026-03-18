@@ -1,6 +1,5 @@
 from __future__ import annotations
 import re
-import uuid as uuid_lib
 from app.extensions import db
 from app.models.vehicle import Vehicle
 from app.repositories.vehicle_repository import VehicleRepository
@@ -10,10 +9,6 @@ from app.utils.vehicle_ref import is_ref_string, from_ref_string
 
 # VIN: 17 chars, alphanumeric excluding I, O, Q
 VIN_PATTERN = re.compile(r'^[A-HJ-NPR-Z0-9]{17}$', re.IGNORECASE)
-UUID_PATTERN = re.compile(
-    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
-    re.IGNORECASE,
-)
 
 
 class VehicleService:
@@ -24,13 +19,22 @@ class VehicleService:
     def get_by_identifier(self, identifier: str) -> Vehicle:
         """
         Auto-route lookup by identifier format:
-        1. UUID format    → lookup by vehicle.id
-        2. 17-char VIN    → lookup by vehicle.vin
-        3. V-XXXXXX ref   → lookup by vehicle.vehicle_number
-        4. Anything else  → ValidationError (400)
+        1. Numeric string / VH-XXXXXX → lookup by vehicle.id (BigInteger PK)
+        2. 17-char VIN                → lookup by vehicle.vin
+        3. V-XXXXXX ref               → lookup by vehicle.vehicle_number
+        4. Anything else              → ValidationError (400)
         """
-        if UUID_PATTERN.match(identifier):
-            vehicle = self.repo.get_by_id(identifier)
+        from app.utils.entity_ref import decode, is_ref
+        # Accept raw int, plain numeric string, or "VH-000001" formatted ref
+        pk: int | None = None
+        if isinstance(identifier, int):
+            pk = identifier
+        elif isinstance(identifier, str) and identifier.isdigit():
+            pk = int(identifier)
+        elif isinstance(identifier, str) and is_ref("vehicle", identifier):
+            pk = decode("vehicle", identifier)
+        if pk is not None:
+            vehicle = self.repo.get_by_id(pk)
             if not vehicle:
                 raise NotFoundError(f"Vehicle {identifier} not found.")
             return vehicle
@@ -49,7 +53,7 @@ class VehicleService:
             return vehicle
 
         raise ValidationError(
-            "Identifier must be a UUID (vehicle ID), a 17-character VIN, or a V-XXXXXX reference number.",
+            "Identifier must be a numeric vehicle ID (or VH-XXXXXX format), a 17-character VIN, or a V-XXXXXX reference number.",
             field="identifier",
         )
 

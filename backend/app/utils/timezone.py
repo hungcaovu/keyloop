@@ -6,11 +6,19 @@ Business-hour validation and lock-key derivation use the dealership's local time
 """
 
 from datetime import datetime, time, timezone, timedelta
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 BUSINESS_START = time(8, 0)   # 08:00 local
 BUSINESS_END   = time(18, 0)  # 18:00 local
+
+
+def validate_timezone_str(timezone_str: str) -> None:
+    """Raise ValueError if timezone_str is not a valid IANA timezone."""
+    try:
+        ZoneInfo(timezone_str)
+    except (ZoneInfoNotFoundError, KeyError):
+        raise ValueError(f"Invalid timezone: '{timezone_str}'.")
 
 
 def to_utc(dt: datetime) -> datetime:

@@ -4,6 +4,7 @@ from sqlalchemy import text, func
 from app.extensions import db
 from app.models.technician import Technician, TechnicianQualification
 from app.models.appointment import Appointment, AppointmentStatus
+from app.repositories.appointment_repository import _active_hold_filter
 
 
 class TechnicianRepository:
@@ -53,14 +54,14 @@ class TechnicianRepository:
         technician_id: str | None = None,
     ) -> list[Technician]:
         """
-        Return qualified technicians with NO overlapping CONFIRMED appointment.
-        Uses NOT EXISTS with the negated overlap condition (A ∩ B ≠ ∅).
+        Return qualified technicians with NO overlapping active appointment
+        (CONFIRMED or unexpired PENDING hold).
         """
         overlap_subq = (
             db.select(Appointment.id)
             .where(
                 Appointment.technician_id == Technician.id,
-                Appointment.status == AppointmentStatus.CONFIRMED.value,
+                _active_hold_filter(),
                 ~db.or_(
                     Appointment.scheduled_end <= window_start,
                     Appointment.scheduled_start >= window_end,
@@ -98,17 +99,15 @@ class TechnicianRepository:
         local_day_end_utc: datetime,
     ) -> Technician | None:
         """
-        Auto-assign strategy: pick the qualified technician with the fewest confirmed
-        appointments on the booking day (dealership local calendar date), breaking
+        Auto-assign strategy: pick the qualified technician with the fewest active
+        appointments (CONFIRMED + unexpired PENDING) on the booking day, breaking
         ties deterministically by technician.id ASC.
-
-        Day range is passed in as UTC so callers handle the timezone conversion (A13).
         """
         bookings_today_subq = (
             db.select(func.count(Appointment.id))
             .where(
                 Appointment.technician_id == Technician.id,
-                Appointment.status == AppointmentStatus.CONFIRMED.value,
+                _active_hold_filter(),
                 Appointment.scheduled_start >= local_day_start_utc,
                 Appointment.scheduled_start < local_day_end_utc,
             )
@@ -120,7 +119,7 @@ class TechnicianRepository:
             db.select(Appointment.id)
             .where(
                 Appointment.technician_id == Technician.id,
-                Appointment.status == AppointmentStatus.CONFIRMED.value,
+                _active_hold_filter(),
                 ~db.or_(
                     Appointment.scheduled_end <= window_start,
                     Appointment.scheduled_start >= window_end,
@@ -156,7 +155,7 @@ class TechnicianRepository:
             db.select(Appointment.id)
             .where(
                 Appointment.technician_id == technician_id,
-                Appointment.status == AppointmentStatus.CONFIRMED.value,
+                _active_hold_filter(),
                 ~db.or_(
                     Appointment.scheduled_end <= window_start,
                     Appointment.scheduled_start >= window_end,

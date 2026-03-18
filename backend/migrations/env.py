@@ -15,8 +15,8 @@ from app.extensions import db
 # Alembic config object (alembic.ini)
 config = context.config
 
-# Override sqlalchemy.url from DATABASE_URL env if set
-database_url = os.getenv("DATABASE_URL")
+# Override sqlalchemy.url from DATABASE_URL or TEST_DATABASE_URL env if set
+database_url = os.getenv("DATABASE_URL") or os.getenv("TEST_DATABASE_URL")
 if database_url:
     config.set_main_option("sqlalchemy.url", database_url)
 
@@ -42,7 +42,9 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    flask_app = create_app()
+    from app.config import TestingConfig, Config
+    cfg = TestingConfig if os.getenv("TEST_DATABASE_URL") else Config
+    flask_app = create_app(cfg)
     with flask_app.app_context():
         connectable = db.engine
 

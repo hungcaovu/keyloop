@@ -2,7 +2,7 @@ from marshmallow import Schema, fields, EXCLUDE
 
 
 class DealershipSchema(Schema):
-    id       = fields.Str(dump_only=True)
+    id       = fields.Int(dump_only=True)
     name     = fields.Str()
     address  = fields.Str(allow_none=True)
     city     = fields.Str()

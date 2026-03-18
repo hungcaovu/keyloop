@@ -54,12 +54,13 @@ class TestGetCustomer:
         resp = client.get(f"/customers/{customer.id}")
         assert resp.status_code == 200
         body = resp.get_json()
-        assert body["customer"]["id"] == customer.id
+        from app.utils.entity_ref import encode
+        assert body["customer"]["id"] == encode("customer", customer.id)
         # vehicles NOT embedded by default
         assert "vehicles" not in body["customer"]
 
     def test_get_by_id_not_found(self, client, db):
-        resp = client.get("/customers/00000000-0000-0000-0000-000000000000")
+        resp = client.get("/customers/999999")
         assert resp.status_code == 404
 
     def test_include_vehicles_empty(self, client, db, customer):
@@ -101,14 +102,14 @@ class TestGetCustomer:
         assert resp.status_code == 404
 
     def test_search_by_phone(self, client, db, customer):
-        # Use query_string dict so Flask test client properly encodes '+' as '%2B'
-        resp = client.get("/customers", query_string={"phone": "+1-555-0101"})
+        # phone search is done via q= (merged into unified search)
+        resp = client.get("/customers", query_string={"q": "+1-555-0101"})
         assert resp.status_code == 200
         body = resp.get_json()
         assert len(body["data"]) == 1
 
     def test_search_without_params_returns_400(self, client, db):
-        """Design: either phone or q is required."""
+        """Design: q is required."""
         resp = client.get("/customers")
         assert resp.status_code == 400
 
@@ -132,7 +133,7 @@ class TestPatchCustomer:
 
     def test_update_not_found(self, client, db):
         resp = client.patch(
-            "/customers/00000000-0000-0000-0000-000000000000",
+            "/customers/999999",
             json={"first_name": "X"},
         )
         assert resp.status_code == 404

@@ -3,6 +3,7 @@ from datetime import datetime
 from app.extensions import db
 from app.models.service_bay import ServiceBay
 from app.models.appointment import Appointment, AppointmentStatus
+from app.repositories.appointment_repository import _active_hold_filter
 
 
 class ServiceBayRepository:
@@ -28,12 +29,13 @@ class ServiceBayRepository:
         window_start: datetime,
         window_end: datetime,
     ) -> list[ServiceBay]:
-        """Return compatible bays with NO overlapping CONFIRMED appointment."""
+        """Return compatible bays with NO overlapping active appointment
+        (CONFIRMED or unexpired PENDING hold)."""
         overlap_subq = (
             db.select(Appointment.id)
             .where(
                 Appointment.service_bay_id == ServiceBay.id,
-                Appointment.status == AppointmentStatus.CONFIRMED.value,
+                _active_hold_filter(),
                 ~db.or_(
                     Appointment.scheduled_end <= window_start,
                     Appointment.scheduled_start >= window_end,
@@ -70,7 +72,7 @@ class ServiceBayRepository:
             db.select(Appointment.id)
             .where(
                 Appointment.service_bay_id == service_bay_id,
-                Appointment.status == AppointmentStatus.CONFIRMED.value,
+                _active_hold_filter(),
                 ~db.or_(
                     Appointment.scheduled_end <= window_start,
                     Appointment.scheduled_start >= window_end,

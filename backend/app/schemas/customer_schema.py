@@ -1,9 +1,10 @@
 from marshmallow import Schema, fields, validate, EXCLUDE
+from app.utils.ref_fields import CustomerRef
 
 
 class CustomerSchema(Schema):
     """Output schema — full customer object."""
-    id            = fields.Str(dump_only=True)
+    id            = CustomerRef(dump_only=True)
     first_name    = fields.Str()
     last_name     = fields.Str()
     email         = fields.Email()

@@ -1,5 +1,5 @@
 import logging
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 from pythonjsonlogger import jsonlogger
 from app.extensions import db
 from app.config import Config
@@ -29,6 +29,17 @@ def create_app(config_object=None):
     app.register_blueprint(dealerships_bp)
     app.register_blueprint(appointments_bp)
     app.register_blueprint(service_types_bp)
+
+    # Request logging
+    @app.after_request
+    def log_request(response):
+        app.logger.info(
+            "%s %s -> %s",
+            request.method,
+            request.path,
+            response.status_code,
+        )
+        return response
 
     # Health check
     @app.get("/health")
@@ -65,19 +76,18 @@ _SWAGGER_UI_HTML = """<!DOCTYPE html>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="stylesheet" type="text/css"
-        href="https://cdn.jsdelivr.net/npm/swagger-ui-dist/swagger-ui.css">
+        href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
 </head>
 <body>
 <div id="swagger-ui"></div>
-<script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist/swagger-ui-bundle.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist/swagger-ui-standalone-preset.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
 <script>
 window.onload = function() {
   SwaggerUIBundle({
     url: "/openapi.json",
     dom_id: '#swagger-ui',
-    presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
-    layout: "StandaloneLayout",
+    presets: [SwaggerUIBundle.presets.apis],
+    layout: "BaseLayout",
     deepLinking: true,
     tryItOutEnabled: true,
   })
@@ -101,12 +111,10 @@ def _register_swagger(app: Flask):
 
 
 def _configure_logging(app: Flask):
-    handler = logging.StreamHandler()
-    formatter = jsonlogger.JsonFormatter(
-        "%(asctime)s %(name)s %(levelname)s %(message)s"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    handler.setFormatter(formatter)
-    app.logger.handlers = [handler]
     app.logger.setLevel(logging.INFO)
 
 

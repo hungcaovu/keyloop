@@ -63,7 +63,7 @@ class TestIsRefString:
     def test_valid_lowercase(self):
         assert is_ref_string("v-000001") is True
 
-    def test_invalid_uuid(self):
+    def test_invalid_dashed_string(self):
         assert is_ref_string("00000000-0000-0000-0000-000000000000") is False
 
     def test_invalid_vin(self):

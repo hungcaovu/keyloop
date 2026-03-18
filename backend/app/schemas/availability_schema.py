@@ -4,19 +4,19 @@ from marshmallow import Schema, fields, validate, EXCLUDE
 # ── Query parameter schemas ─────────────────────────────────────────────────
 
 class CalendarQuerySchema(Schema):
-    service_type_id = fields.Str(required=True)
+    service_type_id = fields.Int(required=True)
     from_date       = fields.Date(load_default=None)
     days            = fields.Int(load_default=15, validate=validate.Range(min=1, max=30))
-    technician_id   = fields.Str(load_default=None)
+    technician_id   = fields.Int(load_default=None)
 
     class Meta:
         unknown = EXCLUDE
 
 
 class SpotCheckQuerySchema(Schema):
-    service_type_id = fields.Str(required=True)
+    service_type_id = fields.Int(required=True)
     desired_start   = fields.DateTime(required=True)
-    technician_id   = fields.Str(load_default=None)
+    technician_id   = fields.Int(load_default=None)
 
     class Meta:
         unknown = EXCLUDE
@@ -29,11 +29,11 @@ class AvailabilityQuerySchema(Schema):
       - desired_start present → Spot Check mode
       - desired_start absent  → Calendar mode
     """
-    service_type_id = fields.Str(required=True)
+    service_type_id = fields.Int(required=True)
     desired_start   = fields.DateTime(load_default=None)
     from_date       = fields.Date(load_default=None)
     days            = fields.Int(load_default=15, validate=validate.Range(min=1, max=30))
-    technician_id   = fields.Str(load_default=None)
+    technician_id   = fields.Int(load_default=None)
 
     class Meta:
         unknown = EXCLUDE
@@ -53,7 +53,7 @@ class DaySlotSchema(Schema):
 
 
 class FilteredTechnicianSchema(Schema):
-    id   = fields.Str()
+    id   = fields.Int()
     name = fields.Str()
 
 
@@ -71,7 +71,7 @@ class CalendarResponseSchema(Schema):
 
 
 class SpotCheckTechnicianSchema(Schema):
-    id              = fields.Str()
+    id              = fields.Int()
     name            = fields.Method("get_full_name")
     employee_number = fields.Str()
 

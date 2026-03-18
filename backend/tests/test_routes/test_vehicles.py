@@ -10,11 +10,12 @@ class TestGetVehicle:
         body = resp.get_json()
         assert body["vehicle"]["vin"] == "1HGCM82633A123456"
 
-    def test_get_by_uuid(self, client, db, vehicle):
+    def test_get_by_id(self, client, db, vehicle):
         resp = client.get(f"/vehicles/{vehicle.id}")
         assert resp.status_code == 200
         body = resp.get_json()
-        assert body["vehicle"]["id"] == vehicle.id
+        from app.utils.entity_ref import encode
+        assert body["vehicle"]["id"] == encode("vehicle", vehicle.id)
 
     def test_get_by_vehicle_ref(self, client, db, vehicle_no_vin):
         """V-000001 format lookup → vehicle without VIN."""
@@ -35,15 +36,15 @@ class TestGetVehicle:
         assert resp.status_code == 404
 
     def test_invalid_identifier_returns_400(self, client, db):
-        resp = client.get("/vehicles/not-a-vin-or-uuid")
+        resp = client.get("/vehicles/not-a-valid-identifier")
         assert resp.status_code == 400
 
     def test_vin_not_found_returns_404(self, client, db):
         resp = client.get("/vehicles/ZZZZZZZZZZZZZZZZZ")
         assert resp.status_code == 404
 
-    def test_uuid_not_found_returns_404(self, client, db):
-        resp = client.get("/vehicles/00000000-0000-0000-0000-000000000000")
+    def test_nonexistent_id_returns_404(self, client, db):
+        resp = client.get("/vehicles/999999")
         assert resp.status_code == 404
 
 
@@ -95,7 +96,7 @@ class TestPostVehicle:
 
     def test_nonexistent_customer_returns_404(self, client, db):
         resp = client.post("/vehicles", json={
-            "customer_id": "00000000-0000-0000-0000-000000000000",
+            "customer_id": 999999,
             "make": "Honda",
             "model": "Civic",
             "year": 2020,
@@ -141,11 +142,12 @@ class TestPatchVehicle:
 
         resp = client.patch(f"/vehicles/{vehicle.id}", json={"customer_id": new_owner_id})
         assert resp.status_code == 200
-        assert resp.get_json()["vehicle"]["customer_id"] == new_owner_id
+        from app.utils.entity_ref import encode
+        assert resp.get_json()["vehicle"]["customer_id"] == encode("customer", new_owner_id)
 
     def test_update_not_found(self, client, db):
         resp = client.patch(
-            "/vehicles/00000000-0000-0000-0000-000000000000",
+            "/vehicles/999999",
             json={"year": 2023},
         )
         assert resp.status_code == 404

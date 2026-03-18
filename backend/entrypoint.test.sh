@@ -31,4 +31,4 @@ echo "[test] Running Alembic migrations on scheduler_test..."
 DATABASE_URL="${TEST_DATABASE_URL}" alembic upgrade head
 
 echo "[test] Starting pytest..."
-exec python -m pytest tests/ -v --tb=short "$@"
+exec python -m pytest tests/ -v --tb=short -s --log-cli-level=INFO "$@"

@@ -27,8 +27,8 @@ from app.repositories.appointment_repository import AppointmentRepository
 from app.repositories.service_type_repository import ServiceTypeRepository
 from app.repositories.dealership_repository import DealershipRepository
 from app.models.technician import Technician
-from app.exceptions import NotFoundError, NoAvailabilityError
-from app.utils.timezone import validate_business_hours, round_up_to_next_slot
+from app.exceptions import NotFoundError, NoAvailabilityError, ValidationError
+from app.utils.timezone import validate_business_hours, round_up_to_next_slot, validate_timezone_str
 
 SLOT_STEP_MINUTES = 30
 NEXT_SLOT_HORIZON_DAYS = 14
@@ -42,6 +42,7 @@ class TimeSlot:
     start: datetime
     end: datetime
     technician_count: int
+    bay_count: int
 
 
 @dataclass
@@ -100,6 +101,10 @@ class AvailabilityService:
     ) -> CalendarResult:
         dealership   = self._get_dealership(dealership_id)
         service_type = self._get_service_type(service_type_id)
+        try:
+            validate_timezone_str(dealership.timezone)
+        except ValueError as e:
+            raise ValidationError(str(e), field="dealership_id")
 
         logger.info(
             "availability.calendar.start",
@@ -134,7 +139,7 @@ class AvailabilityService:
         range_end_utc = _local_day_end_utc(to_date, dealership.timezone)
 
         # ── 3 queries ──────────────────────────────────────────────────────────
-        booked   = self.appt_repo.load_booked_intervals(dealership_id, range_start_utc, range_end_utc)
+        tech_booked, bay_booked = self.appt_repo.load_booked_intervals(dealership_id, range_start_utc, range_end_utc)
         techs    = self.tech_repo.load_qualified(dealership_id, service_type_id, technician_id)
         bays     = self.bay_repo.load_compatible(dealership_id, service_type.required_bay_type)
         # ───────────────────────────────────────────────────────────────────────
@@ -165,26 +170,26 @@ class AvailabilityService:
                 cursor += step
                 continue
 
-            tech_intervals = [booked.get(t.id, []) for t in techs]
-            bay_intervals  = [booked.get(b.id, []) for b in bays]
+            tech_intervals = [tech_booked.get(t.id, []) for t in techs]
+            bay_intervals  = [bay_booked.get(b.id, []) for b in bays]
 
             free_tech_count = sum(
                 1 for intervals in tech_intervals
                 if not _overlaps(intervals, cursor, window_end)
             )
-            any_free_bay = any(
-                not _overlaps(intervals, cursor, window_end)
-                for intervals in bay_intervals
+            free_bay_count = sum(
+                1 for intervals in bay_intervals
+                if not _overlaps(intervals, cursor, window_end)
             )
 
-            if free_tech_count > 0 and any_free_bay:
-                local_start = cursor.replace(tzinfo=timezone.utc).astimezone(tz)
-                local_end   = window_end.replace(tzinfo=timezone.utc).astimezone(tz)
-                slots_by_date[local_start.date()].append(
+            if free_tech_count > 0 and free_bay_count > 0:
+                local_date = cursor.replace(tzinfo=timezone.utc).astimezone(tz).date()
+                slots_by_date[local_date].append(
                     TimeSlot(
-                        start=local_start.replace(tzinfo=None),
-                        end=local_end.replace(tzinfo=None),
+                        start=cursor,       # UTC naive — matches what POST /appointments expects
+                        end=window_end,     # UTC naive
                         technician_count=free_tech_count,
+                        bay_count=free_bay_count,
                     )
                 )
 
@@ -309,6 +314,10 @@ class AvailabilityService:
 
         dealership   = self._get_dealership(dealership_id)
         service_type = self._get_service_type(service_type_id)
+        try:
+            validate_timezone_str(dealership.timezone)
+        except ValueError as e:
+            raise ValidationError(str(e), field="dealership_id")
         tz = ZoneInfo(dealership.timezone)
 
         while cursor < limit:
