@@ -2728,9 +2728,62 @@ The system is designed to scale from thousands to hundreds of thousands of concu
 
 ---
 
-### 16.0 Core Scaling Principles
+### 16.1 Vertical Scaling (no code changes)
 
-Before adding infrastructure, three architectural ideas drive every decision below:
+| Component | Current | Scale up |
+|-----------|---------|----------|
+| Flask/Gunicorn | 4 workers | Increase `GUNICORN_WORKERS` = (2 × CPU cores) + 1 |
+| PostgreSQL | Single node | Add RAM/CPU — doubling RAM roughly doubles buffer cache hit rate |
+| Redis | Single node | Increase instance size to keep more hot data in memory |
+
+Bottlenecks appear in this order:
+
+```
+1. Flask workers saturate (CPU > 80%)
+   → increase GUNICORN_WORKERS or upgrade CPU
+
+2. PostgreSQL connection pool exhausted
+   → add PgBouncer in front of DB
+
+3. PostgreSQL primary overloaded (reads + writes on same node)
+   → add read replica; route GET /availability to replica
+```
+
+---
+
+### 16.2 Horizontal Scaling (when vertical hits its limit)
+
+Once the largest cost-effective instance is still not enough, scale out:
+
+- **Flask/Gunicorn** — stateless by design; add containers behind a load balancer (nginx upstream or cloud LB). No code changes required. Cloud auto-scaling (AWS ECS, Kubernetes HPA) can spin up/down replicas based on CPU or request queue depth.
+- **PostgreSQL** — primary handles writes; read replicas handle availability queries. PgBouncer pools connections on each node.
+- **Redis** — single node is typically sufficient; promote to cluster mode only when memory exceeds the largest single instance.
+
+```
+                    ┌─────────────────────────────┐
+Internet ──► LB ──► │  Flask  │  Flask  │  Flask  │  (auto-scaled)
+                    └────────────────┬────────────┘
+                                     │
+                    ┌────────────────▼────────────┐
+                    │  PgBouncer                  │
+                    └──────┬──────────────┬───────┘
+                           │              │
+                    ┌──────▼──────┐  ┌────▼────────┐
+                    │  PG Primary │  │ PG Replica  │
+                    │  (writes)   │  │  (reads)    │
+                    └─────────────┘  └─────────────┘
+```
+
+**When to move to Step 2:**
+- Flask p95 latency > 200 ms sustained after vertical upgrade
+- PostgreSQL primary CPU > 85% sustained
+- Connection pool queue depth consistently > 20
+
+---
+
+### 16.3 Core Scaling Principles
+
+Before adding infrastructure, three architectural ideas drive every decision above:
 
 #### Read/Write Path Separation
 
@@ -2776,7 +2829,7 @@ Most data accessed during a booking flow is **hot** (same dealerships, same serv
 
 The key insight: **only the booking INSERT itself needs PostgreSQL**. Everything the advisor sees before clicking "Confirm" can come from Redis. At high load, this means 90–95% of requests never touch the DB primary.
 
-#### Invalidation strategy
+#### Cache Invalidation Strategy
 
 ```
 POST /appointments confirmed
@@ -2788,64 +2841,6 @@ PATCH /appointments cancel
 ```
 
 Simple delete-on-write (not update-in-place) avoids cache stampede races. The 30s TTL is a safety net if invalidation fails.
-
----
-
----
-
-### 16.1 Scaling Strategy
-
-Scale in order of complexity — exhaust cheap options before adding infrastructure.
-
-#### Step 1 — Vertical Scaling (no code changes)
-
-| Component | Current | Scale up |
-|-----------|---------|----------|
-| Flask/Gunicorn | 4 workers | Increase `GUNICORN_WORKERS` = (2 × CPU cores) + 1 |
-| PostgreSQL | Single node | Add RAM/CPU — doubling RAM roughly doubles buffer cache hit rate |
-| Redis | Single node | Increase instance size to keep more hot data in memory |
-
-Bottlenecks appear in this order:
-
-```
-1. Flask workers saturate (CPU > 80%)
-   → increase GUNICORN_WORKERS or upgrade CPU
-
-2. PostgreSQL connection pool exhausted
-   → add PgBouncer in front of DB
-
-3. PostgreSQL primary overloaded (reads + writes on same node)
-   → add read replica; route GET /availability to replica
-```
-
-#### Step 2 — Horizontal Scaling (when vertical hits its limit)
-
-Once the largest cost-effective instance is still not enough, scale out:
-
-- **Flask/Gunicorn** — stateless by design; add containers behind a load balancer (nginx upstream or cloud LB). No code changes required. Cloud auto-scaling (AWS ECS, Kubernetes HPA) can spin up/down replicas based on CPU or request queue depth.
-- **PostgreSQL** — primary handles writes; read replicas handle availability queries. PgBouncer pools connections on each node.
-- **Redis** — single node is typically sufficient; promote to cluster mode only when memory exceeds the largest single instance.
-
-```
-                    ┌─────────────────────────────┐
-Internet ──► LB ──► │  Flask  │  Flask  │  Flask  │  (auto-scaled)
-                    └────────────────┬────────────┘
-                                     │
-                    ┌────────────────▼────────────┐
-                    │  PgBouncer                  │
-                    └──────┬──────────────┬───────┘
-                           │              │
-                    ┌──────▼──────┐  ┌────▼────────┐
-                    │  PG Primary │  │ PG Replica  │
-                    │  (writes)   │  │  (reads)    │
-                    └─────────────┘  └─────────────┘
-```
-
-#### When to move to Step 2
-
-- Flask p95 latency > 200 ms sustained after vertical upgrade
-- PostgreSQL primary CPU > 85% sustained
-- Connection pool queue depth consistently > 20
 
 ---
 
