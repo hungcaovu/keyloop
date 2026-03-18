@@ -1,8 +1,20 @@
 import logging
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request, g
 from pythonjsonlogger import jsonlogger
 from app.extensions import db
 from app.config import Config
+
+
+class _RequestIdFilter(logging.Filter):
+    """Inject g.request_id into every log record emitted during a request."""
+
+    def filter(self, record):
+        try:
+            record.request_id = g.get("request_id", None)
+        except RuntimeError:
+            # Outside application context (e.g. startup logs)
+            record.request_id = None
+        return True
 
 
 def create_app(config_object=None):
@@ -30,15 +42,23 @@ def create_app(config_object=None):
     app.register_blueprint(appointments_bp)
     app.register_blueprint(service_types_bp)
 
+    @app.before_request
+    def capture_request_id():
+        """Read X-Request-ID from client; store None if not provided."""
+        g.request_id = request.headers.get("X-Request-ID") or None
+
     # Request logging
     @app.after_request
     def log_request(response):
         app.logger.info(
-            "%s %s -> %s",
+            "%s %s -> %s  request_id=%s",
             request.method,
             request.path,
             response.status_code,
+            g.get("request_id"),
         )
+        if g.get("request_id") is not None:
+            response.headers["X-Request-ID"] = g.request_id
         return response
 
     # Health check
@@ -111,10 +131,16 @@ def _register_swagger(app: Flask):
 
 
 def _configure_logging(app: Flask):
+    rid_filter = _RequestIdFilter()
+
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        format="%(asctime)s [%(levelname)s] %(name)s [request_id=%(request_id)s]: %(message)s",
     )
+    # Attach filter to root handler so ALL loggers pick it up
+    for handler in logging.root.handlers:
+        handler.addFilter(rid_filter)
+
     app.logger.setLevel(logging.INFO)
 
 
