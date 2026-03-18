@@ -1,11 +1,10 @@
-import uuid
 from app.extensions import db
 
 
 class ServiceType(db.Model):
     __tablename__ = "service_types"
 
-    id                = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    id                = db.Column(db.BigInteger, primary_key=True, autoincrement=True)
     name              = db.Column(db.String(255), nullable=False)
     description       = db.Column(db.Text, nullable=True)
     duration_minutes  = db.Column(db.Integer, nullable=False)

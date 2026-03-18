@@ -1,6 +1,21 @@
+import base64
+import logging
 from flask import Blueprint, request, jsonify
 from marshmallow import ValidationError as MarshmallowValidationError
 from app.services.customer_service import CustomerService
+
+logger = logging.getLogger(__name__)
+
+
+def _encode_cursor(item_id: int) -> str:
+    return base64.b64encode(str(item_id).encode()).decode()
+
+
+def _decode_cursor(cursor: str) -> int | None:
+    try:
+        return int(base64.b64decode(cursor).decode())
+    except Exception:
+        return None
 from app.services.vehicle_service import VehicleService
 from app.schemas.customer_schema import (
     CustomerSchema,
@@ -8,6 +23,7 @@ from app.schemas.customer_schema import (
     CustomerUpdateSchema,
 )
 from app.exceptions import NotFoundError, ConflictError
+from app.utils.entity_ref import parse_id
 
 customers_bp = Blueprint("customers", __name__, url_prefix="/customers")
 
@@ -27,9 +43,10 @@ def search_customers():
     GET /customers?phone=+1-555-0101
     GET /customers?q=smith&limit=10
     """
-    phone = request.args.get("phone")
-    q     = request.args.get("q")
-    limit = int(request.args.get("limit", 10))
+    phone  = request.args.get("phone")
+    q      = request.args.get("q")
+    limit  = int(request.args.get("limit", 10))
+    cursor = request.args.get("cursor")
 
     if not phone and not q:
         return jsonify({"error": "Either 'phone' or 'q' query parameter is required."}), 400
@@ -37,9 +54,22 @@ def search_customers():
     if q and len(q) < 2:
         return jsonify({"error": "Query 'q' must be at least 2 characters."}), 400
 
-    customers = get_service().search(phone=phone, q=q, limit=limit)
-    schema = CustomerSchema(many=True)
-    return jsonify({"data": schema.dump(customers)}), 200
+    # cursor only applies to name search (phone search is exact match, no pagination needed)
+    after_id = _decode_cursor(cursor) if (cursor and q) else None
+
+    logger.info("Search customers: phone=%s q=%s limit=%s after_id=%s", phone, q, limit, after_id)
+    items = get_service().search(phone=phone, q=q, limit=limit + 1, after_id=after_id)
+
+    if q:
+        has_more    = len(items) > limit
+        items       = items[:limit]
+        next_cursor = _encode_cursor(items[-1].id) if has_more and items else None
+    else:
+        has_more    = False
+        next_cursor = None
+
+    logger.info("Search customers result: %d found has_more=%s", len(items), has_more)
+    return jsonify({"data": CustomerSchema(many=True).dump(items), "next_cursor": next_cursor}), 200
 
 
 @customers_bp.route("", methods=["POST"])
@@ -50,11 +80,14 @@ def create_customer():
     except MarshmallowValidationError as e:
         return jsonify({"error": "Validation failed", "details": e.messages}), 400
 
+    logger.info("Create customer: email=%s", data.get("email"))
     try:
         customer, warning = get_service().create(**data)
     except ConflictError as e:
+        logger.warning("Create customer conflict: %s", e.message)
         return jsonify({"error": e.message}), 409
 
+    logger.info("Customer created: id=%s", customer.id)
     resp = {"customer": CustomerSchema().dump(customer)}
     if warning:
         resp["warning"] = warning
@@ -72,16 +105,19 @@ def get_customer(customer_id):
     """
     include = {v.strip() for v in request.args.get("include", "").split(",") if v.strip()}
 
+    pk = parse_id("customer", customer_id)
+    logger.info("Get customer: id=%s include=%s", pk, include)
     try:
-        customer = get_service().get_by_id(customer_id)
+        customer = get_service().get_by_id(pk)
     except NotFoundError as e:
+        logger.warning("Customer not found: id=%s", customer_id)
         return jsonify({"error": e.message}), 404
 
     customer_data = CustomerSchema().dump(customer)
 
     if "vehicles" in include:
         from app.schemas.vehicle_schema import VehicleSchema as VS
-        vehicles = VehicleService().list_by_customer(customer_id)
+        vehicles = VehicleService().list_by_customer(pk)
         customer_data["vehicles"] = VS(many=True).dump(vehicles)
 
     return jsonify({"customer": customer_data}), 200
@@ -95,8 +131,10 @@ def update_customer(customer_id):
     except MarshmallowValidationError as e:
         return jsonify({"error": "Validation failed", "details": e.messages}), 400
 
+    pk = parse_id("customer", customer_id)
+    logger.info("Update customer: id=%s fields=%s", pk, list(data.keys()))
     try:
-        customer, warning = get_service().update(customer_id, data)
+        customer, warning = get_service().update(pk, data)
     except NotFoundError as e:
         return jsonify({"error": e.message}), 404
     except ConflictError as e:

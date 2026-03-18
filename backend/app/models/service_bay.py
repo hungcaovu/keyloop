@@ -1,12 +1,11 @@
-import uuid
 from app.extensions import db
 
 
 class ServiceBay(db.Model):
     __tablename__ = "service_bays"
 
-    id            = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    dealership_id = db.Column(db.String(36), db.ForeignKey("dealerships.id"), nullable=False)
+    id            = db.Column(db.BigInteger, primary_key=True, autoincrement=True)
+    dealership_id = db.Column(db.BigInteger, db.ForeignKey("dealerships.id"), nullable=False)
     bay_number    = db.Column(db.String(20), nullable=False)
     bay_type      = db.Column(db.String(50), nullable=False)
     is_active     = db.Column(db.Boolean, nullable=False, default=True)

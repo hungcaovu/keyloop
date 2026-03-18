@@ -1,4 +1,3 @@
-import uuid
 from datetime import datetime, timezone
 from app.extensions import db
 
@@ -6,8 +5,8 @@ from app.extensions import db
 class Vehicle(db.Model):
     __tablename__ = "vehicles"
 
-    id             = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    customer_id    = db.Column(db.String(36), db.ForeignKey("customers.id"), nullable=False, index=True)
+    id             = db.Column(db.BigInteger, primary_key=True, autoincrement=True)
+    customer_id    = db.Column(db.BigInteger, db.ForeignKey("customers.id"), nullable=False, index=True)
     vehicle_number = db.Column(db.BigInteger, unique=True, nullable=True, index=True)
     vin            = db.Column(db.String(17), unique=True, nullable=True)
     make           = db.Column(db.String(100), nullable=False)

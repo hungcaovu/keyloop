@@ -1,5 +1,8 @@
+import logging
 from flask import Blueprint, request, jsonify
 from marshmallow import ValidationError as MarshmallowValidationError
+
+logger = logging.getLogger(__name__)
 from datetime import timezone
 from app.services.appointment_service import AppointmentService
 from app.schemas.appointment_schema import AppointmentCreateSchema, AppointmentSchema
@@ -37,18 +40,27 @@ def create_appointment():
         desired_start = desired_start.astimezone(timezone.utc).replace(tzinfo=None)
     data["desired_start"] = desired_start
 
+    logger.info(
+        "Book appointment: dealership=%s customer=%s vehicle=%s service_type=%s start=%s",
+        data.get("dealership_id"), data.get("customer_id"),
+        data.get("vehicle_id"), data.get("service_type_id"), desired_start,
+    )
     try:
         appointment = get_service().create_appointment(**data)
     except ValidationError as e:
+        logger.warning("Appointment validation error: %s field=%s", e.message, e.field)
         return jsonify({"error": e.message, "field": e.field}), 400
     except NotFoundError as e:
+        logger.warning("Appointment resource not found: %s", e.message)
         return jsonify({"error": e.message}), 404
     except ResourceUnavailableError as e:
         next_slot = e.next_available_slot
+        logger.warning("Appointment conflict: %s next_slot=%s", e.message, next_slot)
         return jsonify({
             "error": "ResourceUnavailable",
             "message": e.message,
             "next_available_slot": next_slot.isoformat() if next_slot else None,
         }), 409
 
+    logger.info("Appointment booked: id=%s start=%s end=%s", appointment.id, appointment.scheduled_start, appointment.scheduled_end)
     return jsonify({"appointment": AppointmentSchema().dump(appointment)}), 201

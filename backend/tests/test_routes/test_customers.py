@@ -54,7 +54,8 @@ class TestGetCustomer:
         resp = client.get(f"/customers/{customer.id}")
         assert resp.status_code == 200
         body = resp.get_json()
-        assert body["customer"]["id"] == customer.id
+        from app.utils.entity_ref import encode
+        assert body["customer"]["id"] == encode("customer", customer.id)
         # vehicles NOT embedded by default
         assert "vehicles" not in body["customer"]
 

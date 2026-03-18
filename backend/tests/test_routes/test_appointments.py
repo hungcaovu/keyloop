@@ -45,7 +45,7 @@ class TestPostAppointments:
         })
         assert resp.status_code == 201
         body = resp.get_json()
-        assert body["appointment"]["technician"]["id"] == technician.id
+        assert body["appointment"]["technician"]["id"] == technician.id  # int, no formatting
 
     def test_missing_required_fields_returns_400(self, client, db):
         resp = client.post("/appointments", json={"customer_id": "some-id"})

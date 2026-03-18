@@ -9,11 +9,11 @@ class CustomerService:
     def __init__(self):
         self.repo = CustomerRepository()
 
-    def search(self, phone: str | None = None, q: str | None = None, limit: int = 10) -> list[Customer]:
+    def search(self, phone: str | None = None, q: str | None = None, limit: int = 10, after_id: int | None = None) -> list[Customer]:
         if phone:
             return self.repo.get_by_phone(phone)
         if q:
-            return self.repo.search_by_name(q, limit=limit)
+            return self.repo.search_by_name(q, limit=limit, after_id=after_id)
         return []
 
     def get_by_id(self, customer_id: str) -> Customer:

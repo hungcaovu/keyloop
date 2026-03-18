@@ -1,10 +1,11 @@
 from marshmallow import Schema, fields, validate, EXCLUDE
 from datetime import date as date_type
+from app.utils.ref_fields import VehicleRef, CustomerRef
 
 
 class VehicleSchema(Schema):
-    id             = fields.Str(dump_only=True)
-    customer_id    = fields.Str()
+    id             = VehicleRef(dump_only=True)
+    customer_id    = CustomerRef()
     vehicle_number = fields.Int(dump_only=True, allow_none=True)
     vehicle_ref    = fields.Method("get_vehicle_ref", dump_only=True)
     vin            = fields.Str(allow_none=True)
@@ -25,7 +26,7 @@ class VehicleSchema(Schema):
 
 
 class VehicleCreateSchema(Schema):
-    customer_id = fields.Str(required=True)
+    customer_id = CustomerRef(required=True)
     vin         = fields.Str(load_default=None, validate=validate.Length(equal=17), allow_none=True)
     make        = fields.Str(required=True, validate=validate.Length(min=1, max=100))
     model       = fields.Str(required=True, validate=validate.Length(min=1, max=100))
@@ -39,7 +40,7 @@ class VehicleCreateSchema(Schema):
 
 
 class VehicleUpdateSchema(Schema):
-    customer_id = fields.Str()
+    customer_id = CustomerRef()
     make        = fields.Str(validate=validate.Length(min=1, max=100))
     model       = fields.Str(validate=validate.Length(min=1, max=100))
     year        = fields.Int(validate=validate.Range(min=1900, max=date_type.today().year + 2))

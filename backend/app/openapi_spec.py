@@ -247,6 +247,12 @@ SPEC: dict = {
                         "in": "query",
                         "schema": {"type": "integer", "default": 10},
                     },
+                    {
+                        "name": "cursor",
+                        "in": "query",
+                        "description": "Opaque cursor for next page (from `next_cursor` in previous response). Only applies to name search (`q`).",
+                        "schema": {"type": "string"},
+                    },
                 ],
                 "responses": {
                     "200": {
@@ -259,7 +265,11 @@ SPEC: dict = {
                                         "data": {
                                             "type": "array",
                                             "items": {"$ref": "#/components/schemas/Customer"},
-                                        }
+                                        },
+                                        "next_cursor": {
+                                            "type": ["string", "null"],
+                                            "description": "Pass as `cursor` to fetch the next page. `null` means no more pages.",
+                                        },
                                     },
                                 }
                             }
@@ -575,6 +585,25 @@ SPEC: dict = {
                 "tags": ["dealerships"],
                 "summary": "List all dealerships",
                 "operationId": "list_dealerships",
+                "parameters": [
+                    {
+                        "name": "q",
+                        "in": "query",
+                        "description": "Name search (min 2 chars)",
+                        "schema": {"type": "string"},
+                    },
+                    {
+                        "name": "limit",
+                        "in": "query",
+                        "schema": {"type": "integer", "default": 10},
+                    },
+                    {
+                        "name": "cursor",
+                        "in": "query",
+                        "description": "Opaque cursor for next page (from `next_cursor` in previous response).",
+                        "schema": {"type": "string"},
+                    },
+                ],
                 "responses": {
                     "200": {
                         "description": "List of dealerships",
@@ -586,7 +615,11 @@ SPEC: dict = {
                                         "data": {
                                             "type": "array",
                                             "items": {"$ref": "#/components/schemas/Dealership"},
-                                        }
+                                        },
+                                        "next_cursor": {
+                                            "type": ["string", "null"],
+                                            "description": "Pass as `cursor` to fetch the next page. `null` means no more pages.",
+                                        },
                                     },
                                 }
                             }
@@ -623,6 +656,25 @@ SPEC: dict = {
                 "tags": ["service-types"],
                 "summary": "List all service types",
                 "operationId": "list_service_types",
+                "parameters": [
+                    {
+                        "name": "q",
+                        "in": "query",
+                        "description": "Name/description search (min 2 chars)",
+                        "schema": {"type": "string"},
+                    },
+                    {
+                        "name": "limit",
+                        "in": "query",
+                        "schema": {"type": "integer", "default": 20},
+                    },
+                    {
+                        "name": "cursor",
+                        "in": "query",
+                        "description": "Opaque cursor for next page (from `next_cursor` in previous response).",
+                        "schema": {"type": "string"},
+                    },
+                ],
                 "responses": {
                     "200": {
                         "description": "List of service types",
@@ -634,7 +686,11 @@ SPEC: dict = {
                                         "data": {
                                             "type": "array",
                                             "items": {"$ref": "#/components/schemas/ServiceType"},
-                                        }
+                                        },
+                                        "next_cursor": {
+                                            "type": ["string", "null"],
+                                            "description": "Pass as `cursor` to fetch the next page. `null` means no more pages.",
+                                        },
                                     },
                                 }
                             }

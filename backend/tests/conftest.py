@@ -21,7 +21,9 @@ to call session.remove() on teardown, detaching all ORM objects.
 
 import os
 import pytest
+import psycopg2
 from datetime import datetime, timezone
+from sqlalchemy import text
 
 from app import create_app
 from app.extensions import db as _db
@@ -43,17 +45,46 @@ def _using_postgres():
 
 # ── App / DB fixtures ──────────────────────────────────────────────────────────
 
+_TRUNCATE_SQL = (
+    "TRUNCATE TABLE appointments, technician_qualifications, technicians,"
+    " service_bays, vehicles, customers, service_types, dealerships"
+    " RESTART IDENTITY CASCADE"
+)
+
+
+def _pg_truncate():
+    """
+    Truncate all tables via a raw psycopg2 connection with autocommit.
+
+    Using psycopg2 directly (not SQLAlchemy) ensures the TRUNCATE is
+    independent of the ORM session lifecycle and connection-pool state.
+    autocommit = True means the statement commits immediately without any
+    wrapping transaction that another pool connection could deadlock against.
+    """
+    conn = psycopg2.connect(os.environ["TEST_DATABASE_URL"])
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(_TRUNCATE_SQL)
+    finally:
+        conn.close()
+
+
 @pytest.fixture(scope="session")
 def app():
     """
     Session-scoped app.
     - SQLite: creates all tables at session start, drops at end.
     - PostgreSQL: assumes schema already exists (run `alembic upgrade head` first).
+      Cleans all data at session start so stale rows from previous runs don't break tests.
     """
     application = create_app(TestingConfig)
     with application.app_context():
         if not _using_postgres():
             _db.create_all()
+        else:
+            # Wipe any data left over from a previous (possibly crashed) run
+            _pg_truncate()
         yield application
         if not _using_postgres():
             _db.drop_all()
@@ -70,16 +101,18 @@ def db(app):
       back at the end, leaving the schema intact for the next test.
     """
     if _using_postgres():
-        # Wrap every test in a SAVEPOINT so we can rollback after
-        with app.app_context():
-            connection = _db.engine.connect()
-            transaction = connection.begin()
-            # Bind the session to this connection so all test code shares it
-            _db.session.configure(bind=connection)
-            yield _db
-            _db.session.remove()
-            transaction.rollback()
-            connection.close()
+        # Fixtures call session.commit(), so SAVEPOINT rollback won't work.
+        # Instead: run each test normally, then TRUNCATE all tables after.
+        # Do NOT open a nested app_context — the session-scoped `app` fixture
+        # already holds one open; nesting causes Flask-SQLAlchemy to remove the
+        # session on inner-context teardown, which defeats the TRUNCATE commit.
+        yield _db
+        # Close the ORM session and ALL pool connections before TRUNCATE.
+        # Flask test-client requests leave connections in the pool that hold
+        # shared locks; if we TRUNCATE while those locks are alive we deadlock.
+        _db.session.remove()
+        _db.engine.dispose()          # release all pooled SQLAlchemy connections
+        _pg_truncate()                # truncate via independent psycopg2 connection
     else:
         # SQLite :memory: — the session-scoped app fixture owns the DB;
         # each function just resets the session state.

@@ -1,6 +1,21 @@
+import base64
+import logging
 from flask import Blueprint, request, jsonify
 from marshmallow import ValidationError as MarshmallowValidationError
 from app.services.dealership_service import DealershipService
+
+logger = logging.getLogger(__name__)
+
+
+def _encode_cursor(item_id: int) -> str:
+    return base64.b64encode(str(item_id).encode()).decode()
+
+
+def _decode_cursor(cursor: str) -> int | None:
+    try:
+        return int(base64.b64decode(cursor).decode())
+    except Exception:
+        return None
 from app.services.availability_service import AvailabilityService
 from app.schemas.dealership_schema import DealershipSchema
 from app.schemas.technician_schema import TechnicianSchema
@@ -9,6 +24,7 @@ from app.schemas.availability_schema import (
     SpotCheckResponseSchema,
 )
 from app.exceptions import NotFoundError
+from app.utils.entity_ref import parse_id
 
 dealerships_bp = Blueprint("dealerships", __name__, url_prefix="/dealerships")
 
@@ -36,15 +52,28 @@ def search_dealerships():
     GET /dealerships
     GET /dealerships?q=metro&limit=10
     """
-    q     = request.args.get("q")
-    limit = int(request.args.get("limit", 10))
+    q      = request.args.get("q")
+    limit  = int(request.args.get("limit", 10))
+    cursor = request.args.get("cursor")
 
     if q is not None and len(q) < 2:
         return jsonify({"error": "Query 'q' must be at least 2 characters."}), 400
 
-    dealerships = get_service().search(q=q, limit=limit)
-    schema = DealershipSchema(many=True)
-    return jsonify({"data": schema.dump(dealerships)}), 200
+    after_id = _decode_cursor(cursor) if cursor else None
+
+    if q:
+        logger.info("List dealerships: q=%s limit=%s after_id=%s", q, limit, after_id)
+    else:
+        logger.info("List dealerships: all limit=%s after_id=%s", limit, after_id)
+
+    items = get_service().search(q=q, limit=limit + 1, after_id=after_id)
+
+    has_more    = len(items) > limit
+    items       = items[:limit]
+    next_cursor = _encode_cursor(items[-1].id) if has_more and items else None
+
+    logger.info("List dealerships result: %d found has_more=%s", len(items), has_more)
+    return jsonify({"data": DealershipSchema(many=True).dump(items), "next_cursor": next_cursor}), 200
 
 
 @dealerships_bp.route("/<string:dealership_id>/technicians", methods=["GET"])
@@ -58,11 +87,16 @@ def list_technicians(dealership_id):
     if not service_type_id:
         return jsonify({"error": "'service_type_id' query parameter is required."}), 400
 
+    d_pk            = parse_id("dealership", dealership_id)
+    service_type_id = int(service_type_id) if service_type_id.isdigit() else None
+    logger.info("List technicians: dealership=%s service_type=%s", d_pk, service_type_id)
     try:
-        techs = get_avail_service().list_qualified_technicians(dealership_id, service_type_id)
+        techs = get_avail_service().list_qualified_technicians(d_pk, service_type_id)
     except NotFoundError as e:
+        logger.warning("List technicians: not found %s", e.message)
         return jsonify({"error": e.message}), 404
 
+    logger.info("List technicians result: %d found", len(techs))
     schema = TechnicianSchema(many=True)
     return jsonify({"data": schema.dump(techs)}), 200
 
@@ -83,6 +117,7 @@ def get_availability(dealership_id):
     except MarshmallowValidationError as e:
         return jsonify({"error": "Invalid query parameters", "details": e.messages}), 400
 
+    d_pk            = parse_id("dealership", dealership_id)
     service_type_id = args["service_type_id"]
     desired_start   = args.get("desired_start")
     technician_id   = args.get("technician_id")
@@ -98,7 +133,7 @@ def get_availability(dealership_id):
                 desired_start = desired_start.astimezone(timezone.utc).replace(tzinfo=None)
 
             result = get_avail_service().check_slot(
-                dealership_id=dealership_id,
+                dealership_id=d_pk,
                 service_type_id=service_type_id,
                 desired_start=desired_start,
                 technician_id=technician_id,
@@ -108,7 +143,7 @@ def get_availability(dealership_id):
         else:
             # ── Calendar mode ──────────────────────────────────────────────────
             result = get_avail_service().get_calendar_slots(
-                dealership_id=dealership_id,
+                dealership_id=d_pk,
                 service_type_id=service_type_id,
                 from_date=from_date,
                 days=days,
