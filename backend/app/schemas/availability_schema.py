@@ -45,6 +45,7 @@ class TimeSlotSchema(Schema):
     start            = fields.DateTime()
     end              = fields.DateTime()
     technician_count = fields.Int()
+    bay_count        = fields.Int()
 
 
 class DaySlotSchema(Schema):

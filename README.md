@@ -1,4 +1,4 @@
-# KeeyLoop — Unified Service Scheduler
+# KeyLoop — Unified Service Scheduler
 
 **Scenario A** of the Keyloop Technical Assessment.
 A full-stack appointment booking system for automotive dealerships — replacing manual scheduling with real-time, concurrent-safe resource booking.
@@ -16,6 +16,37 @@ A full-stack appointment booking system for automotive dealerships — replacing
 | **Containerisation** | Docker Compose | One command to run everything |
 | **CI/CD** | GitHub Actions | Runs on every push and PR — full PostgreSQL test suite in Docker |
 
+
+Youtube Video Demo: https://www.youtube.com/watch?v=qBU2-x-M-oE
+---
+
+## Key Assumptions & Scope
+
+These are the most important decisions that shape the entire design. Full rationale for all 23 assumptions is in [SYSTEM_DESIGN.md](SYSTEM_DESIGN.md).
+
+| # | Assumption | Decision |
+|---|-----------|----------|
+| A1 | **User actor** | API is an **internal tool for Service Advisors** (dealership staff), not a customer self-service portal. |
+| A2 | **Auth** | Out of scope for v1. JWT per dealership is the planned next step — adding it now would obscure the booking logic under assessment. |
+| A3 | **Business hours** | 08:00–18:00 in the **dealership's local timezone**. The appointment must **finish** by 18:00, not just start. A 90-min service at 17:30 is rejected. |
+| A5 | **Conflict response** | On `409`, the API always returns `next_available_slot` within 14 days — never a plain error with no guidance. |
+| A7 | **Technician assignment** | Optional in the request. If provided, validated and pinned. If omitted, the **least-loaded qualified technician** is auto-assigned. |
+| A12 | **Two-phase booking** | `POST /appointments` → `PENDING` (10-min hold). `PATCH /{id}/confirm` → `CONFIRMED`. The hold prevents the race condition between "see availability" and "submit booking". |
+| A13 | **Timezones** | All timestamps stored in UTC. Business hours and lock scope use the **dealership's local calendar date** (e.g. `America/Chicago`), correctly handling DST. |
+| A14 | **Phone uniqueness** | Not enforced — spouses/families share phones. Duplicate phone returns a `warning` alongside the new record; the advisor decides. |
+| A15 | **VIN optional** | A vehicle can be booked without a VIN. VIN-less vehicles receive a `vehicle_number` surrogate (`V-000042`) for verbal/printed reference. Any customer can book any vehicle — ownership is not enforced at booking time. |
+| A23 | **Soft hold TTL** | 10 minutes. Expired holds are **automatically excluded** from availability queries via `expires_at > NOW()` — no cleanup job needed for correctness. |
+
+---
+
+## Key Design Decisions
+
+See [SYSTEM_DESIGN.md](SYSTEM_DESIGN.md) for the full design document covering data model, concurrency strategy, observability, and AI collaboration narrative.
+
+- **Why advisory locks over Redis**: no new infrastructure dependency; lock scope is resource × local calendar date, sorted key order prevents deadlock.
+- **Why PENDING soft hold over immediate CONFIRM**: eliminates the TOCTOU window between availability check and INSERT without requiring `SERIALIZABLE` isolation on every read.
+- **Why BigInteger PK over UUID**: 8-byte int indexes are significantly faster for high-volume slot queries; `VH-000001` display format preserves human-readability.
+
 ---
 
 ## Architecture Highlights
@@ -25,7 +56,7 @@ A full-stack appointment booking system for automotive dealerships — replacing
 The hardest problem: two service advisors booking the same technician + bay at the same time.
 
 ```
-POST /appointments (Phase 1 — PENDING hold):
+POST /appointments (PENDING hold):
   ① Validate entities
   ② Check technician + bay are both free
   ③ Acquire pg_advisory_xact_lock (per resource × calendar date, sorted to prevent deadlock)
@@ -33,7 +64,7 @@ POST /appointments (Phase 1 — PENDING hold):
   ⑤ INSERT PENDING with expires_at = now + 10 min
   → 202 Accepted
 
-PATCH /appointments/{id}/confirm (Phase 2 — CONFIRMED):
+PATCH /appointments/{id}/confirm (CONFIRMED):
   ① Validate hold not expired
   ② Transition PENDING → CONFIRMED, clear expires_at
   → 200 OK
@@ -41,7 +72,7 @@ PATCH /appointments/{id}/confirm (Phase 2 — CONFIRMED):
 
 PENDING holds with an expired `expires_at` are automatically excluded from availability queries — no background cleanup job required for correctness.
 
-### 2. Calendar availability: 3 DB queries for 30 days
+### 2. Calendar availability: 3 DB queries for 15 days
 
 `GET /dealerships/{id}/availability` returns a full multi-day slot grid in exactly **3 queries**, regardless of date range or number of technicians/bays:
 
@@ -166,6 +197,33 @@ docker compose --profile test run --rm test
 docker compose --profile test-pg run --rm test-pg
 ```
 
+### Manual concurrency booking test (flash script)
+
+If you want a quick manual way to verify the race-condition guard (advisory locks + re-check),
+use `backend/tools/flash_booking.py` to fire **N concurrent** `POST /appointments` requests
+for the **same slot**.
+
+Prereqs:
+- Backend running at `http://localhost:5001`
+- Seeded data (e.g. `docker compose --profile seed run --rm seeder`)
+
+Run (auto-picks a valid future slot so you **don't need to set time manually**):
+
+```bash
+python backend/tools/flash_booking.py --n 10 \
+  --dealership-id 1 --service-type-id 1  --technician-id 1\
+  --customer-id C-000001 --vehicle-id VH-000001
+```
+
+Expected output shape:
+- Exactly **1** request succeeds (typically `202 Accepted` with a `PENDING` hold)
+- The remaining requests return **409** conflicts (slot taken by the concurrent winner)
+
+Optional:
+- Confirm the winning hold(s): add `--confirm`
+- Pin a technician: add `--technician-id 1`
+- Force a specific time: add `--desired-start "2026-04-01T14:00:00Z"`
+
 ---
 
 ## CI/CD Pipeline
@@ -228,32 +286,3 @@ frontend/
     BookingWizard.tsx  # Multi-step booking UI (React)
     api.ts             # Typed API client with X-Request-ID
 ```
-
----
-
-## Key Assumptions & Scope
-
-These are the most important decisions that shape the entire design. Full rationale for all 23 assumptions is in [SYSTEM_DESIGN.md](SYSTEM_DESIGN.md).
-
-| # | Assumption | Decision |
-|---|-----------|----------|
-| A1 | **User actor** | API is an **internal tool for Service Advisors** (dealership staff), not a customer self-service portal. |
-| A2 | **Auth** | Out of scope for v1. JWT per dealership is the planned next step — adding it now would obscure the booking logic under assessment. |
-| A3 | **Business hours** | 08:00–18:00 in the **dealership's local timezone**. The appointment must **finish** by 18:00, not just start. A 90-min service at 17:30 is rejected. |
-| A5 | **Conflict response** | On `409`, the API always returns `next_available_slot` within 14 days — never a plain error with no guidance. |
-| A7 | **Technician assignment** | Optional in the request. If provided, validated and pinned. If omitted, the **least-loaded qualified technician** is auto-assigned. |
-| A12 | **Two-phase booking** | `POST /appointments` → `PENDING` (10-min hold). `PATCH /{id}/confirm` → `CONFIRMED`. The hold prevents the race condition between "see availability" and "submit booking". |
-| A13 | **Timezones** | All timestamps stored in UTC. Business hours and lock scope use the **dealership's local calendar date** (e.g. `America/Chicago`), correctly handling DST. |
-| A14 | **Phone uniqueness** | Not enforced — spouses/families share phones. Duplicate phone returns a `warning` alongside the new record; the advisor decides. |
-| A15 | **VIN optional** | A vehicle can be booked without a VIN. VIN-less vehicles receive a `vehicle_number` surrogate (`V-000042`) for verbal/printed reference. Any customer can book any vehicle — ownership is not enforced at booking time. |
-| A23 | **Soft hold TTL** | 10 minutes. Expired holds are **automatically excluded** from availability queries via `expires_at > NOW()` — no cleanup job needed for correctness. |
-
----
-
-## Key Design Decisions
-
-See [SYSTEM_DESIGN.md](SYSTEM_DESIGN.md) for the full design document covering data model, concurrency strategy, observability, and AI collaboration narrative.
-
-- **Why advisory locks over Redis**: no new infrastructure dependency; lock scope is resource × local calendar date, sorted key order prevents deadlock.
-- **Why PENDING soft hold over immediate CONFIRM**: eliminates the TOCTOU window between availability check and INSERT without requiring `SERIALIZABLE` isolation on every read.
-- **Why BigInteger PK over UUID**: 8-byte int indexes are significantly faster for high-volume slot queries; `VH-000001` display format preserves human-readability.
