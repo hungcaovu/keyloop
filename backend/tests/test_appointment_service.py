@@ -249,7 +249,7 @@ class TestAppointmentService:
                 svc.create_appointment(
                     customer_id=customer.id,
                     vehicle_id=vehicle.id,
-                    dealership_id="00000000-0000-0000-0000-000000000000",
+                    dealership_id=999999,
                     service_type_id=service_type_oil.id,
                     desired_start=start,
                 )
