@@ -77,6 +77,10 @@ def run_seed():
                 ("Bay 4", "GENERAL"),
                 ("Bay 5", "GENERAL"),
                 ("Bay 6", "ALIGNMENT"),
+                ("Bay 7", "GENERAL"),
+                ("Bay 8", "GENERAL"),
+                ("Bay 9", "GENERAL"),
+                ("Bay 10", "GENERAL"),
             ]
             for bay_number, bay_type in bay_config:
                 bays.append(ServiceBay(

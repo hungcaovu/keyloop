@@ -1,11 +1,14 @@
 from __future__ import annotations
 from datetime import datetime, timedelta, timezone
+import logging
+import time
 from sqlalchemy import text, func
 from flask import current_app
 from app.extensions import db
 from app.models.appointment import Appointment, AppointmentStatus
 
 PENDING_TTL_MINUTES = 10
+logger = logging.getLogger(__name__)
 
 
 def _active_hold_filter():
@@ -211,7 +214,11 @@ class AppointmentRepository:
         bay_key  = f"bay:{service_bay_id}:{booking_date}"
 
         for key in sorted([tech_key, bay_key]):
+            t0 = time.perf_counter()
+            logger.info("advisory_lock.wait.start key=%s", key)
             db.session.execute(
                 text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
                 {"key": key},
             )
+            waited_ms = (time.perf_counter() - t0) * 1000.0
+            logger.info("advisory_lock.wait.end key=%s waited_ms=%.2f", key, waited_ms)

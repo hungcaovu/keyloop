@@ -166,6 +166,33 @@ docker compose --profile test run --rm test
 docker compose --profile test-pg run --rm test-pg
 ```
 
+### Manual concurrency booking test (flash script)
+
+If you want a quick manual way to verify the race-condition guard (advisory locks + re-check),
+use `backend/tools/flash_booking.py` to fire **N concurrent** `POST /appointments` requests
+for the **same slot**.
+
+Prereqs:
+- Backend running at `http://localhost:5001`
+- Seeded data (e.g. `docker compose --profile seed run --rm seeder`)
+
+Run (auto-picks a valid future slot so you **don't need to set time manually**):
+
+```bash
+python backend/tools/flash_booking.py --n 10 \
+  --dealership-id 1 --service-type-id 1  --technician-id 1\
+  --customer-id C-000001 --vehicle-id VH-000001
+```
+
+Expected output shape:
+- Exactly **1** request succeeds (typically `202 Accepted` with a `PENDING` hold)
+- The remaining requests return **409** conflicts (slot taken by the concurrent winner)
+
+Optional:
+- Confirm the winning hold(s): add `--confirm`
+- Pin a technician: add `--technician-id 1`
+- Force a specific time: add `--desired-start "2026-04-01T14:00:00Z"`
+
 ---
 
 ## CI/CD Pipeline
