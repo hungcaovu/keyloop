@@ -50,7 +50,7 @@ The following assumptions were made where requirements were ambiguous. Each assu
 | A3 | **Business Hours** | The system enforces a **default operating window of 08:00–18:00** for all dealerships in v1. Specifically: `desired_start` must be ≥ 08:00, and `desired_start + duration_minutes` must be ≤ 18:00 (i.e., the appointment must **finish by** 18:00, not merely start before 18:00). A 90-minute Oil Change starting at 17:00 would end at 18:30 and is rejected. `GET /availability` generates slots only where the full window fits within this range. Per-dealership custom schedules require a `DealershipSchedule` entity and are a future enhancement. | A hardcoded default is cleaner than "no enforcement" — it prevents bookings at 03:00 AM and keeps the availability algorithm consistent. Requiring appointment completion (not just start) within business hours reflects real-world constraint: technicians do not work overtime. |
 | A4 | **Technician Working Hours** | Technicians are assumed to be **available during all dealership operating hours**. There are no shift schedules or individual working-hour constraints in v1. | The requirements do not mention technician schedules. A `TechnicianSchedule` entity is noted as a future enhancement. |
 | A5 | **No Slot Available** | When the desired time is unavailable, the API returns the **next available slot** (within a 14-day horizon) rather than returning a plain error. | A plain 409 with no guidance forces the client to retry blindly. Returning a suggestion is a better UX and demonstrates the availability algorithm. |
-| A6 | **Appointment Modification** | Cancellation is part of the **intended appointment lifecycle and domain model** in v1 — the status transition `CONFIRMED → CANCELLED` is fully modelled and the overlap query correctly excludes `CANCELLED` appointments. However, the **HTTP cancel endpoint** (`DELETE /appointments/{id}`) is planned for the next release and not implemented in v1 scope. Reschedule is out of scope and would be modelled as cancel + create (either client-side or via a future convenience endpoint). | The assessment core is booking creation and resource availability. Cancel logic is already baked into the status model and overlap queries; surfacing it as an HTTP endpoint is a straightforward next step and is tracked in §14. |
+| A6 | **Appointment Modification** | Cancellation is part of the **intended appointment lifecycle and domain model** in v1 — the status transition `CONFIRMED → CANCELLED` is fully modelled, the overlap query correctly excludes `CANCELLED` appointments, and the **HTTP cancel endpoint** (`PATCH /appointments/{id}/cancel`) is implemented. Reschedule is out of scope and would be modelled as cancel + create (either client-side or via a future convenience endpoint). | The assessment core is booking creation and resource availability. Cancel is included because it completes the two-phase booking lifecycle — a PENDING hold that the advisor declines must be cancellable to immediately free the slot for other users. |
 | A7 | **Technician Assignment** | `technician_id` is **optional** in `POST /appointments`. If provided, the system validates the technician is qualified and available for the slot then assigns directly. If omitted, the system **auto-assigns the least-loaded qualified technician** (fewest confirmed appointments on the booking date — see §8.4). The intended flow is: client optionally calls `GET /dealerships/{dealership_id}/technicians` to pick a specific technician (Step 0c.5), then passes `technician_id` as a filter in the calendar/spot-check calls, and finally includes it in `POST /appointments`. | Giving Service Advisors the option to pre-select a technician matches real-world practice (customers who prefer a specific technician). Auto-assign with a fair workload distribution strategy ensures coverage when no preference is expressed. |
 | A8 | **Bay Assignment** | Service bay is always **auto-assigned** — clients do not choose a bay. The system picks the first compatible available bay. | Bays are an internal operational resource; Service Advisors and customers have no meaningful preference between bays. |
 | A9 | **Payment & Billing** | Payment, invoicing, and billing are **entirely out of scope**. | Not mentioned in the requirements. Belongs to a different domain (Operate/Finance). |
@@ -158,11 +158,12 @@ sequenceDiagram
         Note over R: include=vehicles → VehicleService.list_by_customer()
         R->>VS: list_by_customer(customer_id)
         VS->>VR: list_by_customer(customer_id)
-        VR->>DB: SELECT vehicles WHERE customer_id = ? ORDER BY created_at ASC
+        VR->>DB: SELECT vehicles WHERE id IN (owned WHERE customer_id=? UNION booked-on-behalf WHERE vehicle_id IN appts) ORDER BY created_at ASC
         DB-->>VR: [Vehicle, ...]
         VR-->>VS: list
         VS-->>R: list
-        R-->>C: 200 OK { customer: { ...fields, vehicles: [...] } }
+        Note over R: Batch-fetch top-3 CONFIRMED appts per vehicle via ROW_NUMBER()<br/>Attach as recent_appointments[] to each vehicle in response
+        R-->>C: 200 OK { customer: { ...fields, vehicles: [{ ...fields, recent_appointments: [...] }] } }
         Note over C: vehicles[] drives Step 0b decision tree<br/>(0 → register new, 1 → auto-select, >1 → show picker)
         opt Info outdated → update
             C->>R: PATCH /customers/{customer_id} { phone, address, ... }
@@ -192,11 +193,21 @@ sequenceDiagram
     Note over C,DB: STEP 0b — Select or Register Vehicle (vehicles[] already loaded above)
 
     alt Customer has existing vehicles (vehicles.length > 0)
-        Note over C: UI shows picker:<br/>"Use existing vehicle" list + "Register new vehicle" option
+        Note over C: UI shows picker:<br/>"Use existing vehicle" list + "Register new vehicle" option<br/>Each vehicle shows last 3 CONFIRMED appointments (service type, date, technician, booked_by)
         alt Advisor selects an existing vehicle
             Note over C: Vehicle id already known — skip lookup
-            opt Info outdated (e.g. ownership transfer)
-                C->>R: PATCH /vehicles/{vehicle_id} { customer_id, make, model, year }
+            opt Advisor searches by VIN or V-XXXXXX (vehicle not in list)
+                C->>R: GET /vehicles/{VIN | V-XXXXXX}
+                R->>VS: get_by_identifier(identifier)
+                VS->>VR: get_by_vin or get_by_vehicle_number
+                VR->>DB: SELECT vehicles WHERE vin=? OR vehicle_number=?
+                DB-->>VR: Vehicle or None
+                VR-->>VS: Vehicle or NotFoundError
+                VS-->>R: Vehicle or NotFoundError
+                R-->>C: 200 OK { vehicle } or 404 Not Found
+            end
+            opt Info outdated (e.g. make/model/year)
+                C->>R: PATCH /vehicles/{vehicle_id} { make, model, year }
                 R->>VS: update(vehicle_id, data)
                 VS->>VR: update(vehicle, data)
                 VR->>DB: UPDATE vehicles SET ... WHERE id = ?
@@ -419,8 +430,9 @@ The business logic core. The service layer is where the domain rules live and is
 **`VehicleService`** — vehicle management:
 
 - Lookup by identifier: auto-routes based on format — `get_by_id` (numeric), `get_by_vin` (17-char VIN), or `get_by_vehicle_number` (`V-XXXXXX` reference). Any other format → `400`.
+- `list_by_customer(customer_id)`: returns vehicles **owned by** the customer (`customer_id = ?`) **UNION** vehicles **used in any non-cancelled appointment** where the customer was the booker (`booked_by_customer_id = ?`). Results are deduplicated and ordered by `created_at ASC`. This ensures booked-on-behalf vehicles (e.g. family car) appear in the customer's vehicle list.
 - Register new vehicle; return `409` with existing record if VIN already exists. Auto-assigns `vehicle_number` (BigInt) for VIN-less vehicles.
-- Update vehicle fields including ownership transfer (`customer_id`).
+- Update vehicle fields (make, model, year, vin).
 
 **`AppointmentService`** — primary orchestrator (two-phase booking):
 
@@ -782,8 +794,19 @@ GET /customers/{customer_id}?include=vehicles
   "customer": {
     "id": "C-000001", "first_name": "Jane", "...",
     "vehicles": [
-      { "id": "VH-000001", "vin": "1HGCM82633A123456", "make": "Honda", "model": "Accord", "year": 2022, "vehicle_ref": null },
-      { "id": "VH-000002", "vin": null, "make": "Toyota", "model": "Camry", "year": 2020, "vehicle_number": 42, "vehicle_ref": "V-000042" }
+      {
+        "id": "VH-000001", "vin": "1HGCM82633A123456", "make": "Honda", "model": "Accord", "year": 2022, "vehicle_ref": null,
+        "recent_appointments": [
+          {
+            "id": 42, "status": "CONFIRMED",
+            "scheduled_start": "2026-03-15T09:00:00Z", "scheduled_end": "2026-03-15T10:00:00Z",
+            "service_type": { "name": "Oil Change" },
+            "technician": { "name": "Mike Johnson" },
+            "booked_by": { "id": "C-000002", "name": "John Smith" }
+          }
+        ]
+      },
+      { "id": "VH-000002", "vin": null, "make": "Toyota", "model": "Camry", "year": 2020, "vehicle_number": 42, "vehicle_ref": "V-000042", "recent_appointments": [] }
     ]
   }
 }
@@ -1216,6 +1239,8 @@ The frontend displays the booking summary with a 10-minute countdown. Advisor re
 | API documentation | **Hand-written OpenAPI 3.1 + Swagger UI (CDN)** | Full OpenAPI 3.1 spec defined in `app/openapi_spec.py`, served at `/openapi.json`. Swagger UI served at `/swagger-ui` via jsDelivr CDN — no npm build step. `flask-smorest` retained in requirements for potential future decorator-driven spec generation. |
 | Metrics | **prometheus-flask-exporter** | Exposes Prometheus metrics at `/metrics`. |
 | Tracing | **OpenTelemetry SDK** | Auto-instruments Flask and SQLAlchemy; manual spans for critical paths. |
+| Frontend | **React 18 + TypeScript + Vite** | Multi-step booking wizard; typed API client with `X-Request-ID` tracing; no UI framework dependency. |
+| CI/CD | **GitHub Actions** | Runs on every push and pull request across all branches. Builds the backend Docker test image, spins up a real PostgreSQL 15 service container, runs Alembic migrations, then executes the full pytest suite — no mocks. |
 
 ---
 
@@ -2097,14 +2122,31 @@ GET /customers/C-000001?include=vehicles
     "country":       "US",
     "created_at":    "2025-06-01T10:00:00Z",
     "vehicles": [
-      { "id": "VH-000001", "vin": "1HGCM82633A123456", "make": "Honda", "model": "Accord", "year": 2022, "vehicle_ref": null },
-      { "id": "VH-000002", "vin": null, "vehicle_number": 42, "vehicle_ref": "V-000042", "make": "Toyota", "model": "Camry", "year": 2020 }
+      {
+        "id": "VH-000001", "vin": "1HGCM82633A123456", "make": "Honda", "model": "Accord", "year": 2022, "vehicle_ref": null,
+        "recent_appointments": [
+          {
+            "id": 7, "status": "CONFIRMED",
+            "scheduled_start": "2026-03-10T14:00:00Z",
+            "scheduled_end":   "2026-03-10T14:30:00Z",
+            "service_type": { "name": "Oil Change" },
+            "technician":   { "name": "Carlos Reyes" },
+            "booked_by":    { "id": "C-000001", "name": "Jane Smith" }
+          }
+        ]
+      },
+      {
+        "id": "VH-000002", "vin": null, "vehicle_number": 42, "vehicle_ref": "V-000042", "make": "Toyota", "model": "Camry", "year": 2020,
+        "recent_appointments": []
+      }
     ]
   }
 }
 ```
 
 > **Why `?include=vehicles`?** The booking UI always needs both customer info and vehicle list immediately after identifying a customer. Embedding vehicles in a single call avoids the sequential round-trip (`GET /customers/{id}` → wait → `GET /customers/{id}/vehicles`). Using a query param keeps the base endpoint lean for callers that only need customer data (e.g. search result detail view).
+>
+> Each vehicle in the response includes a `recent_appointments` array (up to 3 most recent **CONFIRMED** appointments, newest first). Each entry includes `service_type`, `technician`, and `booked_by` (the customer who made the booking — may differ from the vehicle owner when booked on behalf of someone). This lets the advisor review the vehicle's service history at a glance during the vehicle confirmation step — no extra API call required. The field is populated via a single batch `ROW_NUMBER()` window query, not N+1 per-vehicle queries.
 
 **Responses:**
 
@@ -2477,7 +2519,7 @@ All log output is structured JSON emitted to `stdout`. Standard fields on every 
 }
 ```
 
-A `request_id` (UUID) is generated per request in a Flask `before_request` hook and injected into all log records via a logging filter.
+A `request_id` is generated **client-side** as `${timestamp_base36}-${random5}` (e.g. `m1x3k9z-ab4f2`) and sent in the `X-Request-ID` request header. The backend reads it in a `before_request` hook, stores it in Flask `g`, and injects it into all log records via a logging `Filter`. If the header is absent, `request_id` is `null` in logs. The backend echoes the value back in the `X-Request-ID` response header so the client can correlate retries.
 
 | Level | Usage |
 |-------|-------|
@@ -2542,6 +2584,56 @@ Traces export to a configured OTLP collector (Jaeger, Tempo, or Datadog APM). `r
 ---
 
 ## 12. Deployment & Scalability
+
+### 12.0 Docker Compose — Local / Demo Stack
+
+The full stack runs as three containers orchestrated by a single `docker-compose.yml` at the project root:
+
+```
+Browser
+  │
+  │  http://localhost:3000
+  ▼
+┌─────────────────────────────────┐
+│  frontend  (nginx:alpine)        │  port 3000:80
+│                                 │
+│  - Serves React SPA (static)    │
+│  - Proxies /api/* → backend:5000│
+└────────────────┬────────────────┘
+                 │  http://backend:5000  (Docker internal network)
+                 ▼
+┌─────────────────────────────────┐
+│  backend  (python:3.12-slim)    │  port 5001:5000 (host:container)
+│                                 │
+│  - Gunicorn (4 workers)         │
+│  - Flask app                    │
+│  - Runs alembic migrate on boot │
+└────────────────┬────────────────┘
+                 │  postgresql://db:5432/scheduler_db
+                 ▼
+┌─────────────────────────────────┐
+│  db  (postgres:15-alpine)       │  port 5432:5432
+│                                 │
+│  - scheduler_db (app data)      │
+│  - scheduler_test (CI tests)    │
+└─────────────────────────────────┘
+```
+
+**Request flow (booking):**
+1. Advisor opens `http://localhost:3000` → nginx serves `index.html` + React JS bundle
+2. React calls `POST /api/appointments` → nginx strips `/api` prefix, proxies to `http://backend:5000/appointments`
+3. Flask route → `AppointmentService` → advisory lock + INSERT → PostgreSQL
+4. Response travels back: PostgreSQL → Flask → nginx → browser
+
+**Why nginx in front of Flask?**
+Gunicorn is a pure WSGI server — it handles Python but is not optimised for serving static files or handling slow clients. nginx buffers slow client connections so Gunicorn workers are never blocked waiting for a slow browser to receive bytes. In this setup nginx also handles the `/api` → Flask proxy, eliminating CORS entirely.
+
+**Startup order** (enforced by `depends_on: condition: service_healthy`):
+```
+db (healthy) → backend (migrate + start) → frontend (start)
+```
+
+---
 
 ### 12.1 Single-Node Baseline
 
@@ -2693,178 +2785,6 @@ with primary_engine.begin() as conn:          # primary
 
 ---
 
-### 12.7 Scaling to 1M+ Concurrent Users
-
-At 1 million concurrent users the current architecture hits hard limits. This section documents the migration path — each tier is additive; you only go to the next tier when the previous one saturates.
-
-#### Scale estimate
-
-| Metric | Assumption | req/s |
-|--------|-----------|-------|
-| 10% browsing calendar | 100k concurrent → availability reads | ~5,000/s |
-| 1% submitting bookings | 10k concurrent → write path | ~500/s |
-| 0.1% race-conflict retries | next-slot fallback | ~50/s |
-
-This is ~100× beyond the single-node baseline and ~10× beyond the horizontal Flask tier described in §12.3.
-
----
-
-#### What breaks first (in order)
-
-```
-1. PostgreSQL primary write throughput    ← first bottleneck
-2. PostgreSQL advisory locks              ← don't work across shards
-3. Synchronous Flask workers              ← too many threads blocked on I/O
-4. Calendar availability staleness        ← 3-query batch still too slow per user
-5. Single-region latency                  ← global users need geo-distribution
-```
-
----
-
-#### Tier 1 — Replace advisory locks with Redis distributed locks
-
-PostgreSQL advisory locks are scoped to a single DB connection and cannot span shards or replicas. At high write throughput, the lock queue itself becomes a bottleneck.
-
-**Replace with Redis SETNX + TTL:**
-
-```python
-lock_key = f"lock:tech:{technician_id}:{local_booking_date}"
-acquired = redis.set(lock_key, request_id, nx=True, px=5000)  # 5s TTL
-
-if not acquired:
-    raise ResourceUnavailableError(...)
-
-try:
-    # re-check overlap in DB
-    # INSERT appointment
-    db.session.commit()
-finally:
-    # only release if we own the lock
-    if redis.get(lock_key) == request_id:
-        redis.delete(lock_key)
-```
-
-**Why SETNX over RedLock:** Single-node Redis with SETNX + ownership check (compare request_id before delete) is sufficient for this use case. RedLock (multi-node consensus) adds complexity with marginal benefit — the lock only needs to survive Redis for 5 seconds, and a Redis node failure is handled by the TTL auto-expiry.
-
----
-
-#### Tier 2 — Async booking flow (decouple write from response)
-
-Synchronous `POST /appointments` holds a DB connection + Redis lock + worker thread for the full round trip. At 500 writes/second this saturates connection pools.
-
-**Move to async queue:**
-
-```
-Client                API Gateway              Queue             Worker
-  │                       │                     │                  │
-  │── POST /appointments ─▶│                     │                  │
-  │                       │─── publish ─────────▶│                  │
-  │◀── 202 { job_id } ────│                     │── consume ───────▶│
-  │                       │                     │                  │── validate
-  │                       │                     │                  │── lock
-  │                       │                     │                  │── INSERT
-  │── GET /jobs/{id} ─────▶│◀── result ──────────────────────────────│
-  │◀── 200 { CONFIRMED } ─│                     │                  │
-```
-
-- `POST /appointments` → publish to **Kafka** topic `booking.requests` → return `202 Accepted { job_id }`
-- Booking worker (separate service) consumes from Kafka, applies lock + DB write, publishes result to `booking.results`
-- Client polls `GET /bookings/jobs/{job_id}` (backed by Redis result cache, TTL 5 min) OR receives push notification via **WebSocket / SSE**
-
-**Trade-off:** Advisor sees "booking in progress" instead of immediate confirmation. Acceptable for a booking flow; unacceptable for payment. At dealership scale, the delay is < 200ms end-to-end.
-
----
-
-#### Tier 3 — Availability cache (Redis sorted set)
-
-At 5,000 calendar requests/second even 3-query batch becomes expensive. Replace DB reads with a Redis availability cache:
-
-```
-Write path:  POST /appointments (confirmed) → invalidate cache key
-             DELETE /appointments (cancelled) → invalidate cache key
-
-Read path:   GET /availability → check Redis first
-                                  cache hit  → return immediately (< 1ms)
-                                  cache miss → run 3-query batch, populate cache (TTL 30s)
-```
-
-**Cache key:** `avail:{dealership_id}:{service_type_id}:{local_date}`
-**TTL:** 30–60 seconds — acceptable staleness for a calendar browse; spot check always goes to DB for freshness.
-
-**Invalidation strategy:** on every confirmed booking or cancellation, delete the affected `local_date` key. Do not try to update the cached value in-place — delete and let the next request repopulate. Simpler and avoids cache-update races.
-
----
-
-#### Tier 4 — Database sharding by region
-
-A single PostgreSQL primary reaches write saturation at roughly 5,000–10,000 simple INSERTs/second. Shard by `region_id` (a new field on `Dealership`):
-
-```
-Request routing:
-  API Gateway extracts dealership_id from request
-  → lookup dealership region (in-memory config or Redis)
-  → route to correct DB shard
-
-Shard key:   region_id  (e.g. US-EAST, US-WEST, EU, APAC)
-Cross-shard: not needed — appointments never span dealerships
-```
-
-**Why region, not dealership_id:** Sharding by `dealership_id` creates too many small shards. Grouping by region keeps each shard large enough to benefit from PostgreSQL's own connection pool while staying small enough to avoid primary bottlenecks.
-
----
-
-#### Tier 5 — Async workers + auto-scaling (Kubernetes)
-
-Replace Gunicorn sync workers with **async application servers** and deploy on Kubernetes with Horizontal Pod Autoscaler:
-
-```
-                     ┌─────────────────────────────┐
-                     │   API Gateway (rate limit)   │
-                     └────────────┬────────────────┘
-                                  │
-              ┌───────────────────┼───────────────────┐
-              │                   │                   │
-     ┌────────▼──────┐  ┌────────▼──────┐  ┌────────▼──────┐
-     │  FastAPI +    │  │  FastAPI +    │  │  FastAPI +    │  ← K8s pods
-     │  uvicorn      │  │  uvicorn      │  │  uvicorn      │    HPA on CPU/RPS
-     └───────┬───────┘  └───────┬───────┘  └───────┬───────┘
-             │                  │                   │
-             └──────────────────┼───────────────────┘
-                                │
-                    ┌───────────▼──────────┐
-                    │   Redis Cluster      │  locks + cache
-                    └───────────┬──────────┘
-                                │
-                    ┌───────────▼──────────┐
-                    │  PgBouncer (per shard)│
-                    └───────────┬──────────┘
-                                │
-              ┌─────────────────┼─────────────────┐
-              │                 │                 │
-     ┌────────▼──────┐ ┌────────▼──────┐ ┌────────▼──────┐
-     │  PG Primary   │ │  PG Primary   │ │  PG Primary   │  ← shards
-     │  US-EAST      │ │  EU           │ │  APAC         │
-     └───────────────┘ └───────────────┘ └───────────────┘
-```
-
-**Switch Flask → FastAPI + uvicorn:** async I/O means one worker can handle thousands of concurrent requests waiting on DB/Redis — no longer one-thread-per-request. At 1M users this matters: most requests spend > 90% of their time waiting on I/O, not computing.
-
----
-
-#### Migration path summary
-
-| When to migrate | Signal | Change |
-|----------------|--------|--------|
-| > 500 concurrent writes | Lock queue p95 > 200ms | Replace PG advisory locks → Redis SETNX |
-| > 1,000 writes/s | POST /appointments p95 > 500ms | Add Kafka async booking flow |
-| > 5,000 calendar reads/s | DB CPU > 70% | Add Redis availability cache |
-| > 10,000 writes/s | DB primary saturated | Shard by region |
-| > 100,000 req/s | Worker CPU > 70% | Switch to FastAPI + K8s HPA |
-
-Each migration is **independent** — they can be done in any order depending on which bottleneck appears first. The stateless Flask design and clean service/repository layers make each change localised: the lock change is in `AppointmentRepository`, the cache is in `AvailabilityService`, the async flow wraps the existing service layer.
-
----
-
 ## 13. GenAI Collaboration
 
 ### 13.1 How AI Was Used in the Design Phase
@@ -2994,11 +2914,16 @@ AI reviewed the full sequence diagram and found:
 | **VIN assignment** (`PATCH /vehicles/{vehicle_id}/vin`) | **Medium** | Assign or update a VIN on an existing vehicle record. Not implemented in v1. Vehicles without VIN can be registered, looked up by `VH-XXXXXX` ID, and booked normally — VIN is a lookup/display field only (see Assumption A15). |
 | **Idempotency key** (`Idempotency-Key` header on `POST /appointments`) | **High** | If a client times out after POST but the DB already committed, a retry creates a duplicate appointment. An `Idempotency-Key` header (UUID per request) stored in Redis/DB with the response allows replaying the same response on retry. Critical for mobile clients on flaky networks. |
 | **~~Soft hold / temporary reservation~~** | ~~Medium~~ | **Implemented in v1.3** as the PENDING two-phase booking flow. See A12, A23, and §8.6. `POST /appointments` creates a PENDING hold (10-min TTL); `PATCH /confirm` transitions to CONFIRMED. |
+| **~~Cancel endpoint~~** (`PATCH /appointments/{id}/cancel`) | ~~Medium~~ | **Implemented in v1.3.** Accepts `PENDING` or `CONFIRMED` → `CANCELLED`. Releases technician and bay immediately. The frontend calls this when the advisor presses "Cancel Hold" or navigates away during the pending-confirm step. |
+| **~~Frontend booking UI~~** | ~~Medium~~ | **Implemented in v1.3.** Full multi-step React wizard: dealership → customer → vehicle → service type → technician → calendar → review → pending confirm → confirmed. Handles 409 conflicts by reloading the calendar from `next_available_slot`. |
+| **~~CI/CD pipeline~~** | ~~High~~ | **Implemented.** GitHub Actions workflow runs on every push and PR: Docker build → PostgreSQL 15 service → Alembic migrations → full pytest suite. No mocks — always runs against a real PostgreSQL instance. |
 | **Operational workflow states** | **Medium** | Add `CHECKED_IN`, `IN_PROGRESS`, `NO_SHOW` statuses for workshop management. Belongs to a separate operational domain, out of scope for the booking assessment. |
 | **`DealershipSchedule` entity** | **Medium** | Per-dealership custom schedules to replace the hardcoded 08:00–18:00 global default (see A3). Covers different hours, closed days, 24/7 operations. Requires a `DealershipSchedule` entity linked to `Dealership`. |
-| **Appointment read & cancel endpoints** (`GET /appointments`, `GET /appointments/{id}`, `DELETE /appointments/{id}`) | **Medium** | Read and cancel operations listed as planned routes in §4.1. Not implemented in v1 — booking creation is the assessed scope. Cancel is modelled as status transition `CONFIRMED → CANCELLED`. |
-| **Reschedule endpoint** (`POST /appointments/{id}/reschedule`) | **Low** | Convenience wrapper around cancel + re-book in a single atomic operation. v1 clients achieve the same by calling `DELETE` then `POST /appointments`. |
+| **Appointment read endpoints** (`GET /appointments`, `GET /appointments/{id}`) | **Medium** | List and retrieve appointments. Not implemented in v1 — booking creation is the assessed scope. |
+| **Reschedule endpoint** (`POST /appointments/{id}/reschedule`) | **Low** | Convenience wrapper around cancel + re-book in a single atomic operation. v1 clients achieve the same by calling `PATCH /cancel` then `POST /appointments`. |
 | **`booked_by_customer_id` from auth session** | **High** | Currently accepted as an optional field in the request body defaulting to `customer_id`. Once JWT auth (above) is implemented, this should be populated server-side from the token and removed from the client payload entirely. |
+| **Code quality automation** | **Medium** | Add to CI pipeline: `ruff` / `flake8` lint, `mypy` strict type checking for backend; `tsc --noEmit` + `eslint` for frontend. Currently linting is run manually. |
+| **Test coverage reporting** | **Low** | Add `pytest-cov` with coverage upload to Codecov or similar. Gate PRs on coverage regression. |
 
 ---
 

@@ -98,6 +98,38 @@ SPEC: dict = {
                     "color": {"type": ["string", "null"]},
                     "license_plate": {"type": ["string", "null"]},
                     "created_at": {"type": "string", "format": "date-time", "readOnly": True},
+                    "recent_appointments": {
+                        "type": "array",
+                        "readOnly": True,
+                        "description": "Up to 3 most recent CONFIRMED appointments for this vehicle, newest first. Only present when the vehicle is returned via GET /customers/{id}?include=vehicles.",
+                        "items": {"$ref": "#/components/schemas/RecentAppointment"},
+                    },
+                },
+            },
+            "RecentAppointment": {
+                "type": "object",
+                "description": "Summary of a past appointment attached to a vehicle in the vehicle list response.",
+                "properties": {
+                    "id":              {"type": "integer", "readOnly": True},
+                    "status":          {"type": "string", "enum": ["CONFIRMED", "COMPLETED"]},
+                    "scheduled_start": {"type": "string", "format": "date-time"},
+                    "scheduled_end":   {"type": "string", "format": "date-time"},
+                    "service_type":    {"type": "object", "properties": {"name": {"type": "string"}}},
+                    "technician": {
+                        "oneOf": [
+                            {"type": "object", "properties": {"name": {"type": "string"}}},
+                            {"type": "null"},
+                        ],
+                    },
+                    "booked_by": {
+                        "oneOf": [
+                            {"type": "object", "properties": {
+                                "id":   {"type": "string", "example": "C-000001"},
+                                "name": {"type": "string"},
+                            }},
+                            {"type": "null"},
+                        ],
+                    },
                 },
             },
             "VehicleCreate": {
@@ -320,7 +352,7 @@ SPEC: dict = {
                     {
                         "name": "include",
                         "in": "query",
-                        "description": "Comma-separated list of sub-resources to embed. Supported: vehicles",
+                        "description": "Comma-separated list of sub-resources to embed. Supported: `vehicles`. When `vehicles` is included, each vehicle also carries a `recent_appointments` array (up to 3 most recent CONFIRMED appointments, newest first).",
                         "schema": {"type": "string"},
                         "example": "vehicles",
                     },
