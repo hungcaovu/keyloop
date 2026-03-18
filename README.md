@@ -25,7 +25,7 @@ A full-stack appointment booking system for automotive dealerships — replacing
 The hardest problem: two service advisors booking the same technician + bay at the same time.
 
 ```
-POST /appointments (Phase 1 — PENDING hold):
+POST /appointments (PENDING hold):
   ① Validate entities
   ② Check technician + bay are both free
   ③ Acquire pg_advisory_xact_lock (per resource × calendar date, sorted to prevent deadlock)
@@ -33,7 +33,7 @@ POST /appointments (Phase 1 — PENDING hold):
   ⑤ INSERT PENDING with expires_at = now + 10 min
   → 202 Accepted
 
-PATCH /appointments/{id}/confirm (Phase 2 — CONFIRMED):
+PATCH /appointments/{id}/confirm (CONFIRMED):
   ① Validate hold not expired
   ② Transition PENDING → CONFIRMED, clear expires_at
   → 200 OK
