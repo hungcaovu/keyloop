@@ -70,42 +70,46 @@ class AppointmentRepository:
                 bay_booked.setdefault(bay_id, []).append((start, end))
         return tech_booked, bay_booked
 
-    def get_latest_by_vehicle_ids(self, vehicle_ids: list) -> dict:
+    def get_recent_by_vehicle_ids(self, vehicle_ids: list, limit: int = 3) -> dict:
         """
-        Batch-fetch the most recent non-cancelled appointment for each vehicle.
+        Batch-fetch the most recent non-cancelled appointments for each vehicle.
 
-        Returns a dict mapping vehicle_id → Appointment (latest scheduled_start).
-        Vehicles with no appointments are omitted from the result.
+        Returns a dict mapping vehicle_id → [Appointment, ...] sorted by
+        scheduled_start DESC, at most `limit` entries per vehicle.
+        Uses ROW_NUMBER() so only one query is issued regardless of vehicle count.
         """
         if not vehicle_ids:
             return {}
 
-        latest_subq = (
-            db.select(
-                Appointment.vehicle_id,
-                func.max(Appointment.scheduled_start).label("max_start"),
+        rn = (
+            func.row_number()
+            .over(
+                partition_by=Appointment.vehicle_id,
+                order_by=Appointment.scheduled_start.desc(),
             )
+            .label("rn")
+        )
+
+        ranked_subq = (
+            db.select(Appointment.id, rn)
             .where(
                 Appointment.vehicle_id.in_(vehicle_ids),
-                Appointment.status != AppointmentStatus.CANCELLED.value,
+                Appointment.status == AppointmentStatus.CONFIRMED.value,
             )
-            .group_by(Appointment.vehicle_id)
             .subquery()
         )
 
         rows = db.session.execute(
             db.select(Appointment)
-            .join(
-                latest_subq,
-                db.and_(
-                    Appointment.vehicle_id == latest_subq.c.vehicle_id,
-                    Appointment.scheduled_start == latest_subq.c.max_start,
-                ),
-            )
-            .where(Appointment.status != AppointmentStatus.CANCELLED.value)
+            .join(ranked_subq, Appointment.id == ranked_subq.c.id)
+            .where(ranked_subq.c.rn <= limit)
+            .order_by(Appointment.vehicle_id, Appointment.scheduled_start.desc())
         ).scalars().all()
 
-        return {appt.vehicle_id: appt for appt in rows}
+        result: dict = {}
+        for appt in rows:
+            result.setdefault(appt.vehicle_id, []).append(appt)
+        return result
 
     def acquire_locks(
         self,

@@ -116,22 +116,23 @@ def get_customer(customer_id):
         vehicles = VehicleService().list_by_customer(pk)
         vehicle_data = VS(many=True).dump(vehicles)
 
-        # Attach latest non-cancelled appointment per vehicle (1 batch query)
-        vehicle_ids = [v.id for v in vehicles]
-        latest_map  = AppointmentRepository().get_latest_by_vehicle_ids(vehicle_ids)
+        # Attach last 3 non-cancelled appointments per vehicle (1 batch query)
+        vehicle_ids  = [v.id for v in vehicles]
+        recent_map   = AppointmentRepository().get_recent_by_vehicle_ids(vehicle_ids, limit=3)
         for item, v in zip(vehicle_data, vehicles):
-            appt = latest_map.get(v.id)
-            if appt:
-                item["recent_appointment"] = {
-                    "id":              appt.id,
-                    "status":          appt.status,
-                    "scheduled_start": appt.scheduled_start.isoformat() + "Z",
-                    "scheduled_end":   appt.scheduled_end.isoformat() + "Z",
-                    "service_type":    {"name": appt.service_type.name},
-                    "technician":      {"name": f"{appt.technician.first_name} {appt.technician.last_name}"} if appt.technician else None,
+            appts = recent_map.get(v.id, [])
+            item["recent_appointments"] = [
+                {
+                    "id":              a.id,
+                    "status":          a.status,
+                    "scheduled_start": a.scheduled_start.isoformat() + "Z",
+                    "scheduled_end":   a.scheduled_end.isoformat() + "Z",
+                    "service_type":    {"name": a.service_type.name},
+                    "technician":      {"name": f"{a.technician.first_name} {a.technician.last_name}"} if a.technician else None,
+                    "booked_by":       {"id": a.booked_by_customer.id, "name": f"{a.booked_by_customer.first_name} {a.booked_by_customer.last_name}"} if a.booked_by_customer else None,
                 }
-            else:
-                item["recent_appointment"] = None
+                for a in appts
+            ]
 
         customer_data["vehicles"] = vehicle_data
 

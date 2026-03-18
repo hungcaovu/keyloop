@@ -16,10 +16,29 @@ class VehicleRepository:
         ).scalar_one_or_none()
 
     def list_by_customer(self, customer_id: str) -> list[Vehicle]:
+        """
+        Return all vehicles associated with a customer — either owned by them
+        OR used in one of their appointments (booked on behalf of someone else).
+        Results are deduplicated and ordered by vehicle creation date.
+        """
+        from app.models.appointment import Appointment, AppointmentStatus
+
+        # Vehicles owned by this customer
+        owned_ids = db.select(Vehicle.id).where(Vehicle.customer_id == customer_id)
+
+        # Vehicles used in appointments where this customer was the booker
+        appt_vehicle_ids = (
+            db.select(Appointment.vehicle_id)
+            .where(
+                Appointment.customer_id == customer_id,
+                Appointment.status != AppointmentStatus.CANCELLED.value,
+            )
+        )
+
         return list(
             db.session.execute(
                 db.select(Vehicle)
-                .where(Vehicle.customer_id == customer_id)
+                .where(Vehicle.id.in_(owned_ids.union(appt_vehicle_ids)))
                 .order_by(Vehicle.created_at.asc())
             ).scalars().all()
         )
