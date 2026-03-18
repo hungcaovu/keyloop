@@ -1,11 +1,13 @@
 from datetime import datetime, timezone
 from app.extensions import db
 
+_BigInt = db.BigInteger().with_variant(db.Integer, "sqlite")
+
 
 class Customer(db.Model):
     __tablename__ = "customers"
 
-    id           = db.Column(db.BigInteger, primary_key=True, autoincrement=True)
+    id           = db.Column(_BigInt, primary_key=True, autoincrement=True)
     first_name   = db.Column(db.String(100), nullable=False)
     last_name    = db.Column(db.String(100), nullable=False)
     email        = db.Column(db.String(255), nullable=False, index=True)

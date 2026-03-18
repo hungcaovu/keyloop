@@ -1,3 +1,4 @@
+from __future__ import annotations
 import base64
 import logging
 from flask import Blueprint, request, jsonify
@@ -166,6 +167,7 @@ def get_availability(dealership_id):
                                 "start": slot.start.isoformat() + "Z",
                                 "end": slot.end.isoformat() + "Z",
                                 "technician_count": slot.technician_count,
+                                "bay_count": slot.bay_count,
                             }
                             for slot in day.available_times
                         ],

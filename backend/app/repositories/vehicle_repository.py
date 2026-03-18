@@ -1,5 +1,6 @@
 from __future__ import annotations
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError as SAIntegrityError
 
 from app.extensions import db
 from app.models.vehicle import Vehicle
@@ -29,25 +30,33 @@ class VehicleRepository:
         ).scalar_one_or_none()
 
     def create(self, customer_id: str, make: str, model: str, year: int, vin: str | None = None) -> Vehicle:
-        # Auto-assign vehicle_number for vehicles without VIN
-        vehicle_number = None
-        if not vin:
+        if vin:
+            vehicle = Vehicle(
+                customer_id=customer_id, vehicle_number=None,
+                make=make, model=model, year=year, vin=vin.upper(),
+            )
+            db.session.add(vehicle)
+            db.session.flush()
+            return vehicle
+
+        # No VIN — auto-assign vehicle_number. Retry up to 3 times on concurrent conflict.
+        for _attempt in range(3):
             max_num = db.session.execute(
                 db.select(func.max(Vehicle.vehicle_number))
             ).scalar()
-            vehicle_number = (max_num or 0) + 1
-
-        vehicle = Vehicle(
-            customer_id=customer_id,
-            vehicle_number=vehicle_number,
-            make=make,
-            model=model,
-            year=year,
-            vin=vin.upper() if vin else None,
-        )
-        db.session.add(vehicle)
-        db.session.flush()
-        return vehicle
+            vehicle = Vehicle(
+                customer_id=customer_id, vehicle_number=(max_num or 0) + 1,
+                make=make, model=model, year=year, vin=None,
+            )
+            db.session.add(vehicle)
+            sp = db.session.begin_nested()
+            try:
+                db.session.flush()
+                return vehicle
+            except SAIntegrityError:
+                sp.rollback()
+                db.session.expunge(vehicle)
+        raise RuntimeError("Could not auto-assign vehicle reference number. Please try again.")
 
     def update(self, vehicle: Vehicle, data: dict) -> Vehicle:
         allowed = {"customer_id", "make", "model", "year", "vin"}

@@ -1,11 +1,13 @@
 from app.extensions import db
 
+_BigInt = db.BigInteger().with_variant(db.Integer, "sqlite")
+
 
 class ServiceBay(db.Model):
     __tablename__ = "service_bays"
 
-    id            = db.Column(db.BigInteger, primary_key=True, autoincrement=True)
-    dealership_id = db.Column(db.BigInteger, db.ForeignKey("dealerships.id"), nullable=False)
+    id            = db.Column(_BigInt, primary_key=True, autoincrement=True)
+    dealership_id = db.Column(_BigInt, db.ForeignKey("dealerships.id"), nullable=False)
     bay_number    = db.Column(db.String(20), nullable=False)
     bay_type      = db.Column(db.String(50), nullable=False)
     is_active     = db.Column(db.Boolean, nullable=False, default=True)

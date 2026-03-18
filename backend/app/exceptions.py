@@ -39,3 +39,20 @@ class NoAvailabilityError(Exception):
     def __init__(self, message: str = "No availability found within the search horizon."):
         self.message = message
         super().__init__(message)
+
+
+class HoldExpiredError(Exception):
+    """Raised when a PENDING hold's TTL has elapsed before confirmation."""
+
+    def __init__(self, message: str = "The hold has expired. Please select a new time slot.", next_available_slot=None):
+        self.message = message
+        self.next_available_slot = next_available_slot
+        super().__init__(message)
+
+
+class InvalidStateError(Exception):
+    """Raised when an operation is attempted on an appointment in an incompatible status."""
+
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(message)

@@ -73,6 +73,7 @@ class AppointmentSchema(Schema):
     service_bay           = fields.Nested(_ServiceBayBriefSchema)
     scheduled_start       = fields.DateTime(format='%Y-%m-%dT%H:%M:%SZ')
     scheduled_end         = fields.DateTime(format='%Y-%m-%dT%H:%M:%SZ')
+    expires_at            = fields.DateTime(format='%Y-%m-%dT%H:%M:%SZ', allow_none=True)
     notes                 = fields.Str(allow_none=True)
     created_at            = fields.DateTime(format='%Y-%m-%dT%H:%M:%SZ', dump_only=True)
 

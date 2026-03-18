@@ -1,12 +1,14 @@
 from datetime import datetime, timezone
 from app.extensions import db
 
+_BigInt = db.BigInteger().with_variant(db.Integer, "sqlite")
+
 
 class TechnicianQualification(db.Model):
     __tablename__ = "technician_qualifications"
 
-    technician_id   = db.Column(db.BigInteger, db.ForeignKey("technicians.id"), primary_key=True)
-    service_type_id = db.Column(db.BigInteger, db.ForeignKey("service_types.id"), primary_key=True)
+    technician_id   = db.Column(_BigInt, db.ForeignKey("technicians.id"), primary_key=True)
+    service_type_id = db.Column(_BigInt, db.ForeignKey("service_types.id"), primary_key=True)
     certified_at    = db.Column(
         db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
     )
@@ -23,8 +25,8 @@ class TechnicianQualification(db.Model):
 class Technician(db.Model):
     __tablename__ = "technicians"
 
-    id              = db.Column(db.BigInteger, primary_key=True, autoincrement=True)
-    dealership_id   = db.Column(db.BigInteger, db.ForeignKey("dealerships.id"), nullable=False)
+    id              = db.Column(_BigInt, primary_key=True, autoincrement=True)
+    dealership_id   = db.Column(_BigInt, db.ForeignKey("dealerships.id"), nullable=False)
     first_name      = db.Column(db.String(100), nullable=False)
     last_name       = db.Column(db.String(100), nullable=False)
     employee_number = db.Column(db.String(50), unique=True, nullable=False)

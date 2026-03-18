@@ -1,11 +1,13 @@
-"""Initial schema — all tables and indexes (customers, vehicles, dealerships,
-service_types, technicians, service_bays, appointments).
+"""Initial schema — all tables, indexes, and check constraints.
 
 Includes:
   - BigInteger auto-increment PKs
   - vehicle_number (BigInt surrogate ref for VIN-less vehicles)
   - customer address fields (address_line1/2, city, state, postal_code, country)
   - email is indexed but NOT unique (duplicates allowed)
+  - appointments.expires_at for PENDING soft hold TTL (A12, A23)
+  - Overlap indexes cover CONFIRMED + active PENDING holds
+  - Check constraints: appointment status, window order, service_type duration
 
 Revision ID: 001
 Revises:
@@ -90,7 +92,6 @@ def upgrade() -> None:
         sa.Column("employee_number", sa.String(50),  nullable=False, unique=True),
         sa.Column("is_active",       sa.Boolean,     nullable=False, server_default=sa.true()),
     )
-    # Partial index on active technicians (PostgreSQL only)
     op.execute(
         """
         CREATE INDEX idx_technicians_dealership_active
@@ -133,33 +134,42 @@ def upgrade() -> None:
     op.create_table(
         "appointments",
         sa.Column("id",                    sa.BigInteger, primary_key=True, autoincrement=True),
-        sa.Column("customer_id",           sa.BigInteger, sa.ForeignKey("customers.id"),    nullable=False),
-        sa.Column("booked_by_customer_id", sa.BigInteger, sa.ForeignKey("customers.id"),    nullable=True),
-        sa.Column("vehicle_id",            sa.BigInteger, sa.ForeignKey("vehicles.id"),     nullable=False),
-        sa.Column("dealership_id",         sa.BigInteger, sa.ForeignKey("dealerships.id"),  nullable=False),
+        sa.Column("customer_id",           sa.BigInteger, sa.ForeignKey("customers.id"),     nullable=False),
+        sa.Column("booked_by_customer_id", sa.BigInteger, sa.ForeignKey("customers.id"),     nullable=True),
+        sa.Column("vehicle_id",            sa.BigInteger, sa.ForeignKey("vehicles.id"),      nullable=False),
+        sa.Column("dealership_id",         sa.BigInteger, sa.ForeignKey("dealerships.id"),   nullable=False),
         sa.Column("service_type_id",       sa.BigInteger, sa.ForeignKey("service_types.id"), nullable=False),
-        sa.Column("technician_id",         sa.BigInteger, sa.ForeignKey("technicians.id"),  nullable=False),
-        sa.Column("service_bay_id",        sa.BigInteger, sa.ForeignKey("service_bays.id"), nullable=False),
+        sa.Column("technician_id",         sa.BigInteger, sa.ForeignKey("technicians.id"),   nullable=False),
+        sa.Column("service_bay_id",        sa.BigInteger, sa.ForeignKey("service_bays.id"),  nullable=False),
         sa.Column("scheduled_start",       sa.DateTime,   nullable=False),
         sa.Column("scheduled_end",         sa.DateTime,   nullable=False),
         sa.Column("status",                sa.String(20), nullable=False),
+        sa.Column("expires_at",            sa.DateTime,   nullable=True),
         sa.Column("notes",                 sa.Text,       nullable=True),
         sa.Column("created_at",            sa.DateTime,   nullable=False),
         sa.Column("updated_at",            sa.DateTime,   nullable=False),
     )
-    # Partial indexes on CONFIRMED rows for overlap detection
+    # Overlap indexes cover CONFIRMED + unexpired PENDING holds
     op.execute(
         """
         CREATE INDEX idx_appointments_technician_time
             ON appointments (technician_id, scheduled_start, scheduled_end)
-            WHERE status = 'CONFIRMED'
+            WHERE status IN ('CONFIRMED', 'PENDING')
         """
     )
     op.execute(
         """
         CREATE INDEX idx_appointments_bay_time
             ON appointments (service_bay_id, scheduled_start, scheduled_end)
-            WHERE status = 'CONFIRMED'
+            WHERE status IN ('CONFIRMED', 'PENDING')
+        """
+    )
+    # Fast TTL expiry scan
+    op.execute(
+        """
+        CREATE INDEX idx_appointments_pending_expires
+            ON appointments (expires_at)
+            WHERE status = 'PENDING'
         """
     )
     op.create_index(
@@ -168,8 +178,35 @@ def upgrade() -> None:
         ["dealership_id", "status"],
     )
 
+    # ── check constraints ──────────────────────────────────────────────────────
+    _VALID_STATUSES = "('PENDING', 'CONFIRMED', 'CANCELLED', 'COMPLETED', 'EXPIRED')"
+
+    # L3: only valid enum values allowed in appointments.status
+    op.create_check_constraint(
+        "chk_appointments_status",
+        "appointments",
+        f"status IN {_VALID_STATUSES}",
+    )
+
+    # L4: scheduled window must be forward-in-time
+    op.create_check_constraint(
+        "chk_appointments_window_order",
+        "appointments",
+        "scheduled_end > scheduled_start",
+    )
+
+    # L4: service duration must be positive
+    op.create_check_constraint(
+        "chk_service_types_duration_positive",
+        "service_types",
+        "duration_minutes > 0",
+    )
+
 
 def downgrade() -> None:
+    op.drop_constraint("chk_service_types_duration_positive", "service_types")
+    op.drop_constraint("chk_appointments_window_order", "appointments")
+    op.drop_constraint("chk_appointments_status", "appointments")
     op.drop_table("appointments")
     op.drop_table("service_bays")
     op.drop_table("technician_qualifications")

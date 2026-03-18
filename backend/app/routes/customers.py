@@ -1,3 +1,4 @@
+from __future__ import annotations
 import base64
 import logging
 from flask import Blueprint, request, jsonify
@@ -111,8 +112,28 @@ def get_customer(customer_id):
 
     if "vehicles" in include:
         from app.schemas.vehicle_schema import VehicleSchema as VS
+        from app.repositories.appointment_repository import AppointmentRepository
         vehicles = VehicleService().list_by_customer(pk)
-        customer_data["vehicles"] = VS(many=True).dump(vehicles)
+        vehicle_data = VS(many=True).dump(vehicles)
+
+        # Attach latest non-cancelled appointment per vehicle (1 batch query)
+        vehicle_ids = [v.id for v in vehicles]
+        latest_map  = AppointmentRepository().get_latest_by_vehicle_ids(vehicle_ids)
+        for item, v in zip(vehicle_data, vehicles):
+            appt = latest_map.get(v.id)
+            if appt:
+                item["recent_appointment"] = {
+                    "id":              appt.id,
+                    "status":          appt.status,
+                    "scheduled_start": appt.scheduled_start.isoformat() + "Z",
+                    "scheduled_end":   appt.scheduled_end.isoformat() + "Z",
+                    "service_type":    {"name": appt.service_type.name},
+                    "technician":      {"name": f"{appt.technician.first_name} {appt.technician.last_name}"} if appt.technician else None,
+                }
+            else:
+                item["recent_appointment"] = None
+
+        customer_data["vehicles"] = vehicle_data
 
     return jsonify({"customer": customer_data}), 200
 

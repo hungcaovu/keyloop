@@ -1,7 +1,7 @@
 # System Design Document: Unified Service Scheduler
 ## Automotive Dealership Service Appointment Booking
 
-**Version:** 1.2.0
+**Version:** 1.3.0
 **Date:** 2026-03-18
 **Status:** Final
 
@@ -56,14 +56,18 @@ The following assumptions were made where requirements were ambiguous. Each assu
 | A9 | **Payment & Billing** | Payment, invoicing, and billing are **entirely out of scope**. | Not mentioned in the requirements. Belongs to a different domain (Operate/Finance). |
 | A10 | **Notifications** | SMS/email notifications to customers on booking confirmation or cancellation are **out of scope for v1**. | Requires an async job queue (Celery + external provider). Noted as a high-priority future enhancement. |
 | A11 | **Single Dealership per Appointment** | Each appointment belongs to exactly **one dealership**. Multi-location transfers or fleet-wide bookings are not supported. | The requirements specify "a specific dealership" as an input — singular. |
-| A12 | **Appointment Status Flow** | Valid statuses are: `CONFIRMED`, `CANCELLED`, `COMPLETED`. `PENDING` is **not used** — a newly created appointment starts as `CONFIRMED` immediately (no manual confirmation step). Valid transitions: `CONFIRMED → CANCELLED`, `CONFIRMED → COMPLETED`. Attempting to cancel a `COMPLETED` appointment returns `422 Unprocessable Entity`. Operational states such as `CHECKED_IN`, `IN_PROGRESS`, and `NO_SHOW` are intentionally excluded — these belong to workshop management workflow, not the booking domain assessed here. | The requirements say "upon success, create a confirmed Appointment record" — immediate confirmation. PENDING would imply a 2-step workflow not mentioned in requirements. Operational workflow states are a future enhancement. |
+| A12 | **Appointment Status Flow** | Valid statuses are: `PENDING`, `CONFIRMED`, `CANCELLED`, `COMPLETED`, `EXPIRED`. Booking uses a **two-phase commit** pattern: `POST /appointments` creates a `PENDING` soft hold (TTL: 10 minutes, stored in `expires_at`). The advisor confirms with `PATCH /appointments/{id}/confirm` → `CONFIRMED`. If the hold expires without confirmation, the appointment transitions to `EXPIRED` (treated as free by the availability algorithm). Valid transitions: `PENDING → CONFIRMED`, `PENDING → CANCELLED`, `PENDING → EXPIRED` (system), `CONFIRMED → CANCELLED`, `CONFIRMED → COMPLETED`. Attempting to cancel a `COMPLETED` appointment returns `422 Unprocessable Entity`. Operational states such as `CHECKED_IN`, `IN_PROGRESS`, and `NO_SHOW` are intentionally excluded — these belong to workshop management workflow, not the booking domain assessed here. | A two-phase flow prevents race conditions where two advisors see the same slot as available and both submit bookings. The PENDING hold (10-minute TTL) is short enough to not frustrate real users but long enough for an advisor to complete the confirmation form. The existing advisory lock infrastructure already acquires separate locks for tech and bay in sorted order — PENDING reuses this without new dependencies. See §8.6 for the full design rationale. |
+| A23 | **Soft Hold TTL** | PENDING appointments have a fixed TTL of **10 minutes** (`expires_at = created_at + 10 minutes`). After expiry the hold is treated as free by all availability queries. A background cleanup task (or on-demand query) may transition `PENDING` past `expires_at` to `EXPIRED` for cleanliness, but is not required for correctness — the availability filter `expires_at > NOW()` ensures expired holds are excluded automatically. The frontend countdown timer shows the remaining hold time and warns the advisor when fewer than 2 minutes remain. | 10 minutes is long enough for an advisor to review the booking summary and confirm; short enough that a slot is not locked indefinitely if the advisor closes the browser tab. |
 | A13 | **Timezone** | All appointment timestamps are **stored in UTC**. Business-hour validation (`08:00–18:00`) and calendar slot generation are evaluated in the **dealership's local timezone** using `Dealership.timezone`, then converted to UTC for persistence and overlap checks. For example, a dealership in `America/Chicago` (UTC−5) has its business window treated as `13:00–23:00 UTC`; a booking at 09:00 local is stored as `14:00 UTC`. `booking_date` used as the advisory lock scope is also the local calendar date (not the UTC date). Client-facing datetime responses are returned in UTC with `Z` suffix; clients display local time using the `Dealership.timezone` field. | Storing UTC avoids ambiguity and DST storage edge cases. Validating business hours in local time is correct — a dealership that closes at 18:00 local does not care what UTC time that is. Deriving lock scope from local date is also correct — "same day" means the same working day at the dealership, not the same UTC calendar date. |
 | A14 | **Phone Uniqueness** | Phone number is **not a hard unique constraint**. Multiple customers may share a phone (e.g. spouses, family). A phone lookup returning multiple results requires the advisor to disambiguate by name. Duplicate phone on `POST /customers` is allowed but a `warning` flag is returned alongside existing matches so the advisor can decide whether to create a new record or reuse an existing one. | Hard uniqueness would reject legitimate cases. Soft warning gives advisors the information they need to make the right decision. |
-| A15 | **Vehicle Ownership & VIN** | `Vehicle.customer_id` represents the **current primary owner** but is not enforced during booking. Any customer can book a service for any vehicle (e.g. dropping off a spouse's car, fleet management). `POST /vehicles` with an existing VIN returns `409` with the existing vehicle record. **VIN is optional** — the system supports booking for vehicles with or without a VIN. All booking operations use `vehicle_id` (UUID) as the identifier; VIN is a display/lookup field only. Vehicles registered without a VIN receive a `vehicle_number` (BigInteger auto-increment) as a human-readable surrogate reference, encoded as `"V-000001"`. This provides a stable short reference that staff can relay to a customer verbally or display on printed paperwork, without exposing the internal UUID. | A vehicle awaiting delivery may not have a VIN yet but still needs a service booking. Forcing VIN presence would block legitimate cases. The `vehicle_number` surrogate fills the operational gap: advisors can say "your reference is V-000042" instead of reading out a UUID. A BigInteger index is significantly more efficient than a 36-char UUID string index for this supplementary lookup path. |
+| A15 | **Vehicle Ownership & VIN** | `Vehicle.customer_id` represents the **current primary owner** but is not enforced during booking. Any customer can book a service for any vehicle (e.g. dropping off a spouse's car, fleet management). `POST /vehicles` with an existing VIN returns `409` with the existing vehicle record. **VIN is optional** — the system supports booking for vehicles with or without a VIN. All booking operations use `vehicle_id` (`VH-XXXXXX` format) as the identifier; VIN is a display/lookup field only. Vehicles registered without a VIN receive a `vehicle_number` (BigInteger auto-increment) as a human-readable surrogate reference, encoded as `"V-000001"`. This provides a stable short reference that staff can relay to a customer verbally or display on printed paperwork. | A vehicle awaiting delivery may not have a VIN yet but still needs a service booking. Forcing VIN presence would block legitimate cases. The `vehicle_number` surrogate fills the operational gap: advisors can say "your reference is V-000042". A BigInteger index is significantly more efficient than a varchar string index for this supplementary lookup path. |
 | A16 | **Technician Dealership Guard** | Even though `GET /availability` only returns technicians from the requested dealership, `POST /appointments` independently validates that the provided `technician_id` belongs to the same `dealership_id`. This server-side guard prevents manipulation by clients bypassing the availability check. | Defence in depth — the API layer should not trust that clients always follow the intended flow. |
 | A17 | **Max Booking Horizon** | `desired_start` is accepted up to **90 days** in the future. Requests beyond 90 days return `400 Bad Request`. | Beyond 90 days, resource availability is too uncertain to be meaningful. Limits unbounded far-future bookings. |
 | A18 | **No Availability Beyond Horizon** | If `find_next_slot` finds no opening within the 14-day search window, the API returns `200 OK` with `available: false`, `next_available_slot: null`, and `message: "No availability found within the 14-day search horizon. Please contact the dealership directly."` | A 503 would imply server error. This is a business state — the dealership is fully booked — communicated as a clear message. |
 | A19 | **Calendar `from_date` in the Past or Present** | If `from_date` is today or in the past, the system auto-adjusts the search start to **now + 1 hour** (rounded up to the next 30-min slot boundary). Past slots are never returned. | Returning already-passed slots would be misleading. Adding 1 hour ensures the earliest bookable slot has enough preparation lead time. |
+| A20 | **Single Service Type per Appointment** | Each appointment covers exactly **one service type**. Booking multiple services (e.g., Oil Change + Brake Inspection) in a single transaction is not supported in v1. | Multiple service types may require different bay types, different technician qualifications, and non-contiguous time blocks — combining them significantly increases scheduling complexity. A multi-service booking would be modelled as separate appointments in a future release. |
+| A21 | **Same-Day Completion** | All services are assumed to complete **within a single business day**. Appointments that would run past closing time (18:00 dealership local time) are rejected at booking time. Multi-day jobs (e.g., major bodywork, engine overhaul) are out of scope. | The availability algorithm blocks technician and bay for a contiguous window `[start, start + duration_minutes]`. Spanning overnight would require overnight bay locking, shift handover logic, and potentially different pricing — all beyond the v1 scope. |
+| A22 | **Service Types are Vehicle-Agnostic** | `ServiceType` is a dealership-level catalog entry with no vehicle class restriction. The same "Oil Change" entry applies to all vehicles regardless of type (car, motorcycle, truck, etc.). Vehicle-class-specific service filtering (e.g., motorcycle-only services, heavy vehicle bays) is **not supported in v1**. | Modelling vehicle-class compatibility would require a `VehicleClass` enum on `Vehicle`, a many-to-many `ServiceTypeVehicleClass` join table, and filtering logic in the availability query. This adds significant schema complexity. A future release can introduce a `vehicle_class` field on `Vehicle` and a `compatible_vehicle_classes` filter on `ServiceType`. |
 
 ---
 
@@ -134,11 +138,11 @@ sequenceDiagram
     R-->>C: 200 OK { data: [{ id, name, city, state, timezone }] }
 
     Note over C,DB: STEP 0a — Find or Register Customer
-    C->>R: GET /customers?phone=+1-555-0101
-    R->>CS: search_by_phone(phone)
-    CS->>CR: get_by_phone(phone)
-    CR->>DB: SELECT customers WHERE phone = ?
-    DB-->>CR: List[Customer] (0, 1, or many if shared number)
+    C->>R: GET /customers?q=smith
+    R->>CS: search_any(q)
+    CS->>CR: search_by_any(q)
+    CR->>DB: SELECT customers WHERE first_name/last_name/phone ILIKE ?
+    DB-->>CR: List[Customer]
 
     alt Customer(s) found → load profile + vehicles in one call
         CR-->>CS: List[Customer]
@@ -288,7 +292,7 @@ sequenceDiagram
     AS-->>R: { available, available_technicians[], bay_available, next_available_slot? }
     R-->>C: 200 OK { available, available_technicians: [{ id, name, employee_number }], bay_available, next_available_slot? }
 
-    Note over C,DB: STEP 1–8 — Confirm Appointment (Phase 2)
+    Note over C,DB: STEP 1 — Create PENDING Soft Hold (Phase 2a)
     C->>R: POST /appointments { customer_id, vehicle_id, dealership_id, service_type_id, desired_start, technician_id? }
     R->>S: create_appointment(booking_request)
     S->>STR: get_service_type(service_type_id)
@@ -298,7 +302,7 @@ sequenceDiagram
 
     alt technician_id provided by client
         S->>TR: validate_and_get(technician_id, service_type_id, window_start, window_end)
-        TR->>DB: SELECT technician WHERE qualified AND no overlap (JOIN appointments)
+        TR->>DB: SELECT technician WHERE qualified AND no overlap (excl. EXPIRED/CANCELLED PENDING)
         DB-->>TR: Technician or None
     else technician_id omitted — auto-assign (least-loaded-today)
         S->>TR: find_least_loaded_available(dealership_id, service_type_id, window_start, window_end)
@@ -307,23 +311,42 @@ sequenceDiagram
     end
 
     S->>BR: find_available_bay(dealership_id, bay_type, window_start, window_end)
-    BR->>DB: SELECT first bay WHERE compatible AND no overlap (JOIN appointments)
+    BR->>DB: SELECT first bay WHERE compatible AND no overlap
     DB-->>BR: ServiceBay or None
 
     alt Both technician AND bay available
-        S->>AR: create_appointment(...)
+        S->>AR: create_pending(...)
         AR->>DB: SELECT pg_advisory_xact_lock(hashtext('tech:{technician_id}:{booking_date}'))
         AR->>DB: SELECT pg_advisory_xact_lock(hashtext('bay:{service_bay_id}:{booking_date}'))
-        AR->>DB: INSERT INTO appointments
+        AR->>DB: INSERT INTO appointments (status=PENDING, expires_at=now+10min)
         DB-->>AR: Appointment
-        AR-->>S: Appointment
+        AR-->>S: Appointment (PENDING)
         S-->>R: Appointment DTO
-        R-->>C: 201 Created { appointment: { id, status: CONFIRMED, technician, service_bay, scheduled_start, scheduled_end, ... } }
+        R-->>C: 202 Accepted { appointment: { id, status: PENDING, expires_at, technician, service_bay, ... } }
     else Resource unavailable (race condition edge case)
         S->>AS: find_next_slot(dealership_id, service_type_id, desired_start)
         AS-->>S: next_available_slot
         S-->>R: ResourceUnavailableError
         R-->>C: 409 Conflict { next_available_slot }
+    end
+
+    Note over C,DB: STEP 2 — Confirm Hold (Phase 2b)
+    C->>R: PATCH /appointments/{id}/confirm
+    R->>S: confirm_appointment(id)
+    S->>AR: get_by_id(id)
+    AR->>DB: SELECT appointments WHERE id = ?
+    DB-->>AR: Appointment
+    AR-->>S: Appointment
+    alt Hold still valid (expires_at > now AND status = PENDING)
+        S->>AR: confirm(appointment)
+        AR->>DB: UPDATE appointments SET status=CONFIRMED, expires_at=NULL WHERE id=?
+        DB-->>AR: Appointment
+        AR-->>S: Appointment (CONFIRMED)
+        S-->>R: Appointment DTO
+        R-->>C: 200 OK { appointment: { id, status: CONFIRMED, scheduled_start, scheduled_end, ... } }
+    else Hold expired or already processed
+        S-->>R: HoldExpiredError / InvalidStateError
+        R-->>C: 409 Conflict { error: "Hold expired", next_available_slot }
     end
 ```
 
@@ -349,12 +372,14 @@ The route layer contains no business logic. It is intentionally thin.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/appointments` | Book a new service appointment |
+| `POST` | `/appointments` | Create a PENDING soft hold — two-phase booking step 1 |
+| `PATCH` | `/appointments/{appointment_id}/confirm` | Confirm a PENDING hold → CONFIRMED (two-phase booking step 2) |
+| `PATCH` | `/appointments/{appointment_id}/cancel` | Cancel a PENDING or CONFIRMED appointment |
 | `GET` | `/dealerships` | Search dealerships by name (typeahead) |
 | `GET` | `/dealerships/{dealership_id}/availability` | Calendar view or spot check availability (optional `technician_id` filter) |
 | `GET` | `/dealerships/{dealership_id}/technicians` | List qualified technicians for a service type (Step 0c.5) |
 | `POST` | `/customers` | Register a customer |
-| `GET` | `/customers` | Search customers by phone (exact) or name (typeahead) |
+| `GET` | `/customers` | Search customers by name or phone in a single unified query (`?q=`) |
 | `GET` | `/customers/{customer_id}` | Get full customer profile. `?include=vehicles` embeds the vehicle list in one call. |
 | `PATCH` | `/customers/{customer_id}` | Update customer info (name, phone, email, address) |
 | `POST` | `/vehicles` | Register a vehicle |
@@ -371,7 +396,6 @@ The route layer contains no business logic. It is intentionally thin.
 |--------|------|-------------|----------|
 | `GET` | `/appointments` | List appointments by date / dealership | Medium |
 | `GET` | `/appointments/{appointment_id}` | Retrieve appointment details | Medium |
-| `DELETE` | `/appointments/{appointment_id}` | Cancel an appointment | Medium |
 | `POST` | `/appointments/{appointment_id}/reschedule` | Reschedule (cancel + rebook in one call) | Medium |
 | `PATCH` | `/vehicles/{vehicle_id}/vin` | Assign or update VIN on an existing vehicle | Medium |
 | `GET` | `/technicians` | Global unscoped technician list (cross-dealership admin use) | Low |
@@ -398,14 +422,12 @@ The business logic core. The service layer is where the domain rules live and is
 - Register new vehicle; return `409` with existing record if VIN already exists. Auto-assigns `vehicle_number` (BigInt) for VIN-less vehicles.
 - Update vehicle fields including ownership transfer (`customer_id`).
 
-**`AppointmentService`** — primary orchestrator:
+**`AppointmentService`** — primary orchestrator (two-phase booking):
 
-- Loads the `ServiceType` to determine `duration_minutes` and `required_bay_type`.
-- Computes the appointment window: `[desired_time, desired_time + duration_minutes]`.
-- Delegates availability queries to repositories.
-- Enforces the dual-resource constraint (technician AND bay must both be free for the full window).
-- Writes the confirmed `Appointment` record atomically.
-- Suggests the next available slot if either resource is unavailable.
+- **Phase 1 — `create_appointment()`:** Loads `ServiceType`, computes the appointment window, enforces the dual-resource constraint (technician AND bay must both be free), acquires advisory locks, re-checks after lock, then writes a `PENDING` `Appointment` with `expires_at = now + 10 minutes`. Returns `202 Accepted` with the pending appointment and `expires_at`.
+- **Phase 2 — `confirm_appointment(id)`:** Validates the hold has not expired, transitions status `PENDING → CONFIRMED`, clears `expires_at`. Returns `200 OK` with the confirmed appointment.
+- **Cancel — `cancel_appointment(id)`:** Accepts `PENDING` or `CONFIRMED` → `CANCELLED`. Releases resources immediately.
+- **Expiry:** Availability queries exclude PENDING holds where `expires_at <= NOW()`. An optional background cleanup job transitions stale PENDING → EXPIRED for audit clarity.
 
 **`AvailabilityService`** — slot suggestion helper:
 
@@ -477,7 +499,7 @@ erDiagram
     %% - VIN is unique per physical car; POST with existing VIN returns 409 + existing record
     %% - vehicle_number: BigInt auto-increment for VIN-less vehicles; encoded as "V-000001"
     %%   for human-readable reference. NULL for vehicles that have a VIN.
-    %%   8-byte integer index is significantly faster than 36-char UUID string index.
+    %%   8-byte integer index is significantly faster than a varchar string index.
 
     DEALERSHIP {
         bigint id PK
@@ -530,7 +552,8 @@ erDiagram
         bigint service_bay_id FK
         timestamp scheduled_start
         timestamp scheduled_end
-        string status
+        string status "PENDING|CONFIRMED|CANCELLED|COMPLETED|EXPIRED"
+        timestamp expires_at "nullable; set only for PENDING holds"
         string notes
         timestamp created_at
         timestamp updated_at
@@ -551,13 +574,13 @@ erDiagram
 
 ### 5.2 Entity Descriptions
 
-**Customer** — A person who books appointments. Identified by email (unique). Phone is indexed for lookup but not unique — spouses or family members may share a number. A `warning` is returned on `POST /customers` if an existing record shares the same phone. Optional address fields (`address_line1`, `address_line2`, `city`, `state`, `postal_code`, `country`) capture the customer's mailing/residential address; all are nullable and `country` defaults to `"US"`. Address information is stored for reference and record-keeping and can be updated at any time via `PATCH /customers/{id}`.
+**Customer** — A person who books appointments. Primary key is a BigInteger auto-increment (`C-000001` format in API responses). Email is **not** unique — family members or shared accounts may use the same email address, same as phone. Both are indexed for lookup but not unique. A `warning` is returned on `POST /customers` if an existing record shares the same phone. Optional address fields (`address_line1`, `address_line2`, `city`, `state`, `postal_code`, `country`) capture the customer's mailing/residential address; all are nullable and `country` defaults to `"US"`. Address information is stored for reference and record-keeping and can be updated at any time via `PATCH /customers/{id}`.
 
-**Vehicle** — A physical car. `customer_id` records the current primary owner but is not enforced during booking — anyone can book a service for any vehicle. Multiple vehicles per customer are supported.
+**Vehicle** — A physical car. Primary key is a BigInteger auto-increment (`VH-000001` format in API responses). `customer_id` records the current primary owner but is not enforced during booking — anyone can book a service for any vehicle. Multiple vehicles per customer are supported.
 
-Two identifier fields beyond the primary UUID:
+Two additional identifier fields beyond the primary key:
 - **`vin`** (optional, unique) — 17-character Vehicle Identification Number. `POST /vehicles` with an existing VIN returns `409` with the existing record. `null` for vehicles registered without a VIN.
-- **`vehicle_number`** (optional, unique, BigInteger) — auto-assigned only when `vin` is `null`. Provides a short human-readable surrogate reference encoded as `"V-000001"` (zero-padded 6-digit, `V-` prefix). `null` for vehicles that have a VIN. A BigInt index (8 bytes) is used instead of a UUID string index (36 chars) for this supplementary lookup path.
+- **`vehicle_number`** (optional, unique, BigInteger) — auto-assigned only when `vin` is `null`. Provides a short human-readable surrogate reference encoded as `"V-000001"` (zero-padded 6-digit, `V-` prefix). `null` for vehicles that have a VIN. A BigInt index (8 bytes) is significantly faster than a string-based index for this supplementary lookup path.
 
 **Dealership** — A physical service location. Owns a pool of technicians and service bays. Stores a timezone string to correctly interpret business hours.
 
@@ -571,7 +594,13 @@ Two identifier fields beyond the primary UUID:
 
 **ServiceBay** — A physical workspace within a dealership. Has a `bay_type` that must match the `required_bay_type` of the service type.
 
-**Appointment** — The central domain object. Captures the confirmed booking with references to all domain entities, plus `scheduled_start`, `scheduled_end`, and `status` (`CONFIRMED`, `CANCELLED`, `COMPLETED`). Starts as `CONFIRMED` immediately on creation — no `PENDING` state.
+**Appointment** — The central domain object. Captures the booking with references to all domain entities, plus `scheduled_start`, `scheduled_end`, `status`, and `expires_at`. Uses a two-phase commit lifecycle:
+
+- `PENDING` — soft hold created by `POST /appointments`. Resources (technician + bay) are reserved but the booking is not yet confirmed. `expires_at` is set to `created_at + 10 minutes`. Availability queries treat active PENDING holds as occupied.
+- `CONFIRMED` — advisor confirmed via `PATCH /appointments/{id}/confirm`. Resources locked permanently until the appointment occurs or is cancelled. `expires_at` is cleared (set to `NULL`).
+- `CANCELLED` — cancelled from either `PENDING` or `CONFIRMED` state. Resources released immediately.
+- `COMPLETED` — service was rendered. Terminal state.
+- `EXPIRED` — PENDING hold was not confirmed within the TTL. Resources released. Treated identically to `CANCELLED` by availability queries.
 
 Two customer references are stored separately:
 - `customer_id` — the vehicle's primary owner (who the service is **for**)
@@ -597,10 +626,10 @@ The full booking flow has two phases: **Pre-check** (browse and select) then **C
 │           → Returns: id, name, city, state, timezone        │
 │           → Typeahead — advisor selects dealership          │
 │                                                             │
-│  Step 0a: GET /customers?phone= or ?q=                      │
+│  Step 0a: GET /customers?q=<name or phone>                  │
 │           → Returns: id, first_name, last_name, email, phone│
-│           → Phone may return multiple (shared) — advisor    │
-│             picks correct one, then:                        │
+│           → Searches name + phone in one query — advisor    │
+│             picks correct result, then:                     │
 │           → FOUND? → GET /customers/{customer_id}           │
 │                    → PATCH /customers/{customer_id} (update)│
 │           → NOT FOUND? → POST /customers (register new)     │
@@ -612,7 +641,7 @@ The full booking flow has two phases: **Pre-check** (browse and select) then **C
 │           → NONE or NEW? → advisor looks up by VIN/ref or   │
 │             registers: POST /vehicles                        │
 │           → FOUND by identifier? →                          │
-│             GET /vehicles/{VIN | UUID | V-XXXXXX}           │
+│             GET /vehicles/{VIN | VH-XXXXXX | V-XXXXXX}       │
 │           → Update if needed: PATCH /vehicles/{vehicle_id}  │
 │                                                             │
 │  Step 0c: GET /service-types?q=<name>                       │
@@ -639,11 +668,19 @@ The full booking flow has two phases: **Pre-check** (browse and select) then **C
                           │
                           ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  PHASE 2 — CONFIRM (Submit Appointment)                     │
+│  PHASE 2 — CONFIRM (Two-Phase Submit)                       │
 │                                                             │
-│  Step 1–8: POST /appointments                               │
-│            { ..., technician_id (optional) }               │
-│            → Validate → Assign resources → Persist          │
+│  Step 1: POST /appointments                                 │
+│          { ..., technician_id (optional) }                  │
+│          → Validate → Assign resources → Create PENDING     │
+│          → Returns 202 + expires_at (10-min TTL)            │
+│                                                             │
+│  Step 2: PATCH /appointments/{id}/confirm                   │
+│          → Transitions PENDING → CONFIRMED                  │
+│          → Returns 200 with confirmed appointment           │
+│                                                             │
+│  Cancel (any time): PATCH /appointments/{id}/cancel         │
+│          → Transitions PENDING or CONFIRMED → CANCELLED     │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -663,8 +700,8 @@ GET /dealerships?q=metro&limit=10
 ```json
 {
   "data": [
-    { "id": "uuid-...", "name": "Metro Honda Service Center", "city": "Austin", "state": "TX" },
-    { "id": "uuid-...", "name": "Metro Toyota", "city": "Austin", "state": "TX" }
+    { "id": 1, "name": "Metro Honda Service Center", "city": "Austin", "state": "TX" },
+    { "id": 2, "name": "Metro Toyota", "city": "Austin", "state": "TX" }
   ]
 }
 ```
@@ -675,14 +712,14 @@ Advisor selects the correct dealership and obtains `dealership_id` used in all s
 
 #### Step 0a — Find or Register Customer
 
-Customer walks in or calls. Advisor looks them up first — by phone (preferred, fast) or by name (fallback).
+Customer walks in or calls. Advisor types a name or phone number — both are searched in a single query.
 
 ```bash
-# Primary: phone lookup — exact match, fast (usually 1 result, may return multiple if shared)
-GET /customers?phone=+1-555-0101
+# Search by name (partial match)
+GET /customers?q=smith&limit=10
 
-# Fallback: name typeahead
-GET /customers?q=smi&limit=10
+# Search by phone — same endpoint, phone is just another searchable field
+GET /customers?q=%2B1-555-0101&limit=10
 ```
 
 **Returning customer:** Advisor selects from search results → system loads full profile:
@@ -743,10 +780,10 @@ GET /customers/{customer_id}?include=vehicles
 ```json
 {
   "customer": {
-    "id": "uuid-...", "first_name": "Jane", "...",
+    "id": "C-000001", "first_name": "Jane", "...",
     "vehicles": [
-      { "id": "uuid-...", "vin": "1HGCM82633A123456", "make": "Honda", "model": "Accord", "year": 2022, "vehicle_ref": null },
-      { "id": "uuid-...", "vin": null, "make": "Toyota", "model": "Camry", "year": 2020, "vehicle_number": 42, "vehicle_ref": "V-000042" }
+      { "id": "VH-000001", "vin": "1HGCM82633A123456", "make": "Honda", "model": "Accord", "year": 2022, "vehicle_ref": null },
+      { "id": "VH-000002", "vin": null, "make": "Toyota", "model": "Camry", "year": 2020, "vehicle_number": 42, "vehicle_ref": "V-000042" }
     ]
   }
 }
@@ -764,7 +801,7 @@ GET /customers/{customer_id}?include=vehicles
 
 ```bash
 PATCH /vehicles/{vehicle_id}
-{ "customer_id": "new-owner-uuid", "year": 2023 }
+{ "customer_id": "C-000001", "year": 2023 }
 ```
 
 **Path B — Register new vehicle (no VIN):** Customer calls in and doesn't know their VIN yet.
@@ -772,11 +809,11 @@ PATCH /vehicles/{vehicle_id}
 ```bash
 POST /vehicles
 {
-  "customer_id": "a1b2c3d4-...",
+  "customer_id": "C-000001",
   "make": "Toyota", "model": "Camry", "year": 2020
 }
 # Response includes auto-assigned vehicle_number and vehicle_ref:
-# { "vehicle": { "id": "...", "vehicle_number": 42, "vehicle_ref": "V-000042", "vin": null, ... } }
+# { "vehicle": { "id": "VH-000002", "vehicle_number": 42, "vehicle_ref": "V-000042", "vin": null, ... } }
 ```
 
 **Path C — Register new vehicle (with VIN):** Advisor scans or enters VIN.
@@ -784,7 +821,7 @@ POST /vehicles
 ```bash
 POST /vehicles
 {
-  "customer_id": "a1b2c3d4-...",
+  "customer_id": "C-000001",
   "vin":   "1HGCM82633A123456",
   "make":  "Honda", "model": "Accord", "year": 2022
 }
@@ -803,7 +840,7 @@ GET /vehicles/V-000042
 ```
 
 > **Auto-detection:** The single `GET /vehicles/{identifier}` endpoint detects the identifier type by format:
-> - UUID pattern (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) → looks up by `vehicle.id`
+> - Numeric string or `VH-XXXXXX` format → looks up by `vehicle.id` (BigInt PK)
 > - 17-char VIN pattern (`[A-HJ-NPR-Z0-9]{17}`) → looks up by `vehicle.vin`
 > - `V-XXXXXX` pattern (`V-` prefix + 1–10 digits, case-insensitive) → looks up by `vehicle.vehicle_number`
 > - Anything else → `400 Bad Request`
@@ -827,16 +864,16 @@ Returns all service types with `duration_minutes` and `required_bay_type`. Advis
 If the customer has a preference ("I always come to Carlos"), the advisor can fetch the list of qualified technicians for the chosen service type first, then filter the calendar to that specific technician.
 
 ```bash
-GET /dealerships/i9j0k1l2-.../technicians?service_type_id=m3n4o5p6-...
+GET /dealerships/1/technicians?service_type_id=2
 ```
 
 **Response:**
 ```json
 {
   "data": [
-    { "id": "uuid-t1", "name": "Carlos Reyes",  "employee_number": "T-001" },
-    { "id": "uuid-t2", "name": "Maria Santos",  "employee_number": "T-004" },
-    { "id": "uuid-t3", "name": "James Okafor",  "employee_number": "T-007" }
+    { "id": "1", "name": "Carlos Reyes",  "employee_number": "T-001" },
+    { "id": "2", "name": "Maria Santos",  "employee_number": "T-004" },
+    { "id": "3", "name": "James Okafor",  "employee_number": "T-007" }
   ]
 }
 ```
@@ -849,17 +886,17 @@ The advisor picks the preferred technician and passes `technician_id` as an opti
 
 ```bash
 # Without technician filter — show slots where ANY qualified technician is free
-GET /dealerships/i9j0k1l2-.../availability
-  ?service_type_id=m3n4o5p6-...
+GET /dealerships/1/availability
+  ?service_type_id=2
   &from_date=2026-03-20
   &days=15
 
 # With technician filter — show slots where ONLY Carlos is free
-GET /dealerships/i9j0k1l2-.../availability
-  ?service_type_id=m3n4o5p6-...
+GET /dealerships/1/availability
+  ?service_type_id=2
   &from_date=2026-03-20
   &days=15
-  &technician_id=uuid-t1
+  &technician_id=1
 ```
 
 > **`from_date` in the past or today:** The system auto-adjusts the search start to **now + 1 hour**, rounded up to the next 30-minute boundary. Past slots are never returned (see Assumption A19).
@@ -874,7 +911,7 @@ Slots that fail either condition are **excluded entirely** — the advisor only 
 
 ```json
 {
-  "filtered_technician": { "id": "uuid-t1", "name": "Carlos Reyes" },
+  "filtered_technician": { "id": "1", "name": "Carlos Reyes" },
   "slots": [
     {
       "date": "2026-03-20",
@@ -903,15 +940,15 @@ The Advisor and customer pick a date and time from the calendar.
 
 ```bash
 # Without filter — returns ALL available technicians for that slot
-GET /dealerships/i9j0k1l2-.../availability
-  ?service_type_id=m3n4o5p6-...
+GET /dealerships/1/availability
+  ?service_type_id=2
   &desired_start=2026-03-20T09:00:00
 
 # With filter — confirms whether Carlos specifically is still free
-GET /dealerships/i9j0k1l2-.../availability
-  ?service_type_id=m3n4o5p6-...
+GET /dealerships/1/availability
+  ?service_type_id=2
   &desired_start=2026-03-20T09:00:00
-  &technician_id=uuid-t1
+  &technician_id=1
 ```
 
 Called once the user has selected a slot from the calendar. Returns the available technician list for that exact window.
@@ -923,8 +960,8 @@ Called once the user has selected a slot from the calendar. Returns the availabl
 {
   "available": true,
   "available_technicians": [
-    { "id": "uuid-t1", "name": "Carlos Reyes", "employee_number": "T-001" },
-    { "id": "uuid-t2", "name": "Maria Santos", "employee_number": "T-004" }
+    { "id": "1", "name": "Carlos Reyes", "employee_number": "T-001" },
+    { "id": "2", "name": "Maria Santos", "employee_number": "T-004" }
   ],
   "bay_available": true,
   "next_available_slot": null
@@ -943,12 +980,12 @@ Called once the user has selected a slot from the calendar. Returns the availabl
 curl -X POST http://localhost:5000/appointments \
   -H "Content-Type: application/json" \
   -d '{
-    "customer_id":    "a1b2c3d4-...",
-    "vehicle_id":     "e5f6g7h8-...",
-    "dealership_id":  "i9j0k1l2-...",
-    "service_type_id":"m3n4o5p6-...",
+    "customer_id":    "C-000001",
+    "vehicle_id":     "VH-000001",
+    "dealership_id":  "1",
+    "service_type_id":"2",
     "desired_start":  "2026-03-20T09:00:00",
-    "technician_id":  "uuid-t1",
+    "technician_id":  "1",
     "notes": "Hearing a grinding noise from front-left wheel"
   }'
 ```
@@ -959,10 +996,10 @@ curl -X POST http://localhost:5000/appointments \
 
 #### Step 2 — Route Handler Validates Request
 
-`BookingRequestSchema` (marshmallow) enforces:
-- All required UUIDs are present and well-formed.
+`AppointmentCreateSchema` (marshmallow) enforces:
+- `customer_id` and `vehicle_id` are valid `C-XXXXXX` / `VH-XXXXXX` references or plain integers.
+- `dealership_id`, `service_type_id`, and optional `technician_id` are integers.
 - `desired_start` is a valid ISO 8601 datetime at least 1 hour in the future.
-- If `technician_id` is provided, it is a valid UUID format.
 
 If validation fails → `400 Bad Request` with field-level errors. No database access occurs.
 
@@ -1014,7 +1051,8 @@ WHERE t.dealership_id  = :dealership_id
       SELECT 1
       FROM appointments a
       WHERE a.technician_id = t.id
-        AND a.status        = 'CONFIRMED'
+        AND a.status IN ('CONFIRMED', 'PENDING')
+        AND (a.expires_at IS NULL OR a.expires_at > NOW())   -- active holds block the slot
         AND NOT (
             a.scheduled_end   <= :window_start
             OR
@@ -1023,7 +1061,7 @@ WHERE t.dealership_id  = :dealership_id
   )
 ```
 
-Both conditions must pass: a technician who is qualified but already booked, or available but unqualified, is excluded.
+Both conditions must pass: a technician who is qualified but already booked (or PENDING-held), or available but unqualified, is excluded. The `expires_at` guard ensures expired PENDING holds do not block availability without requiring cleanup.
 
 ---
 
@@ -1121,25 +1159,42 @@ The second concurrent request, upon acquiring the lock, re-checks availability a
 
 ---
 
-#### Step 8 — Response
+#### Step 8 — Response (Phase 2a — PENDING)
 
-`201 Created` with the full confirmed appointment:
+`202 Accepted` with the pending appointment and expiry timestamp:
 
 ```json
 {
-  "id": "uuid-...",
-  "status": "CONFIRMED",
-  "customer": { "id": "...", "name": "Jane Smith" },
-  "booked_by_customer": { "id": "...", "name": "John Smith" },   // expanded from booked_by_customer_id
-  "vehicle": { "vin": "1HGCM82633A123456", "year": 2022, "make": "Honda", "model": "Accord" },
-  "dealership": { "id": "...", "name": "Metro Honda Service Center" },
-  "service_type": { "name": "Brake Inspection", "duration_minutes": 90 },
-  "technician": { "id": "uuid-t1", "name": "Carlos Reyes" },
-  "service_bay": { "bay_number": "Bay 4", "bay_type": "LIFT" },
+  "id": 1,
+  "status": "PENDING",
+  "expires_at": "2026-03-20T09:10:00Z",
+  "customer": { "id": "C-000001", "name": "Jane Smith" },
+  "booked_by_customer": { "id": "C-000002", "name": "John Smith" },
+  "vehicle": { "id": "VH-000001", "vin": "1HGCM82633A123456", "year": 2022, "make": "Honda", "model": "Accord" },
+  "dealership": { "id": 1, "name": "Metro Honda Service Center" },
+  "service_type": { "id": 2, "name": "Brake Inspection", "duration_minutes": 90 },
+  "technician": { "id": 1, "name": "Carlos Reyes" },
+  "service_bay": { "id": 1, "bay_number": "Bay 4", "bay_type": "LIFT" },
   "scheduled_start": "2026-03-20T09:00:00Z",
   "scheduled_end":   "2026-03-20T10:30:00Z",
   "notes": "Hearing a grinding noise from front-left wheel",
-  "created_at": "2026-03-17T14:22:01Z"
+  "created_at": "2026-03-20T09:00:00Z"
+}
+```
+
+The frontend displays the booking summary with a 10-minute countdown. Advisor reviews and confirms.
+
+#### Step 9 — Confirm (Phase 2b — CONFIRMED)
+
+`200 OK` after `PATCH /appointments/{id}/confirm`:
+
+```json
+{
+  "id": 1,
+  "status": "CONFIRMED",
+  "expires_at": null,
+  "scheduled_start": "2026-03-20T09:00:00Z",
+  "scheduled_end":   "2026-03-20T10:30:00Z"
 }
 ```
 
@@ -1212,7 +1267,8 @@ JOIN technician_qualifications tq
     ON tq.technician_id = t.id AND tq.service_type_id = :service_type_id
 LEFT JOIN appointments a
     ON a.technician_id = t.id
-   AND a.status = 'CONFIRMED'
+   AND a.status IN ('CONFIRMED', 'PENDING')
+   AND (a.expires_at IS NULL OR a.expires_at > NOW())
    AND a.scheduled_start >= :local_day_start_utc   -- start of dealership's local working day in UTC
    AND a.scheduled_start <  :local_day_end_utc     -- end of dealership's local working day in UTC
 WHERE t.dealership_id = :dealership_id
@@ -1220,7 +1276,8 @@ WHERE t.dealership_id = :dealership_id
   AND NOT EXISTS (
       SELECT 1 FROM appointments a2
       WHERE a2.technician_id = t.id
-        AND a2.status = 'CONFIRMED'
+        AND a2.status IN ('CONFIRMED', 'PENDING')
+        AND (a2.expires_at IS NULL OR a2.expires_at > NOW())
         AND NOT (a2.scheduled_end <= :window_start OR a2.scheduled_start >= :window_end)
   )
 GROUP BY t.id
@@ -1242,9 +1299,31 @@ LIMIT 1
 
 ### 8.5 No Double-Booking: Three-Layer Defense
 
-1. **Overlap query in repository** (optimistic check): SQL excludes resources with overlapping `CONFIRMED` appointments using the `NOT (end <= start OR start >= end)` pattern.
-2. **PostgreSQL advisory lock** (pessimistic guard): Two fine-grained locks per resource (`tech:{id}:{booking_date}` + `bay:{id}:{booking_date}`) serialise only competing requests for the same resource on the same day, preventing TOCTOU race conditions without unnecessary serialisation of unrelated bookings.
+1. **Overlap query in repository** (optimistic check): SQL excludes resources with overlapping **active** appointments — `status IN ('CONFIRMED', 'PENDING') AND (expires_at IS NULL OR expires_at > NOW())` — using the `NOT (end <= start OR start >= end)` pattern. EXPIRED and CANCELLED holds are excluded automatically; the `expires_at` guard ensures expired PENDING holds release the slot without requiring a cleanup job to have run.
+2. **PostgreSQL advisory lock** (pessimistic guard): Two fine-grained locks per resource (`tech:{id}:{booking_date}` + `bay:{id}:{booking_date}`) serialise only competing requests for the same resource on the same day, preventing TOCTOU race conditions without unnecessary serialisation of unrelated bookings. The same lock infrastructure covers both PENDING hold creation and future CONFIRMED re-checks.
 3. **`EXCLUDE USING gist` constraint** (future): DB-level range overlap prevention using `tsrange` — noted as a future hardening option to avoid adding the `btree_gist` extension in v1.
+
+### 8.6 Soft Hold Design Rationale
+
+The PENDING approach was chosen after evaluating five alternatives:
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| **No hold (v1 original)** | Simplest. Zero new infrastructure. | Two advisors can see the same slot and race to POST. Second loses with 409 and must restart flow — poor UX. |
+| **PENDING status ✅ chosen** | Reuses existing lock infrastructure. No new dependencies. Single source of truth. Advisory lock ensures atomic PENDING creation. `expires_at` auto-releases without a cleanup job. | Requires two HTTP round-trips (POST → confirm). Frontend must track expires_at and show countdown. |
+| **Redis TTL ephemeral hold** | Sub-millisecond hold/release. Handles multi-instance cleanly. | Redis becomes a hard dependency. Lock must cover both tech AND bay atomically — two separate Redis keys risk partial failure. Adds operational complexity. |
+| **SlotHold table** | Audit trail of all holds. | Schema migration + cleanup job required. Equivalent to PENDING but with a separate table — more complexity for no additional benefit at this scale. |
+| **In-memory / sticky sessions** | Zero DB overhead. | Fails immediately with multiple Gunicorn workers or horizontal scaling. Not viable. |
+
+**Why PENDING is sufficient here:**
+- The existing `appointment_repository.acquire_locks()` already acquires `tech:{id}:{date}` and `bay:{id}:{date}` advisory locks in sorted order (deadlock-safe) — PENDING creation runs inside the same lock scope, guaranteeing atomicity of the dual-resource hold.
+- `expires_at > NOW()` in the availability filter is a simple timestamp comparison — no Redis or scheduled job needed for correctness.
+- The 10-minute TTL (A23) is long enough for an advisor to review and confirm; short enough that the slot is not locked indefinitely on browser close.
+
+**Frontend responsibilities:**
+- Display a countdown timer once `expires_at` is received.
+- Call `PATCH /appointments/{id}/cancel` if the advisor navigates away (page `beforeunload` or "Back" button).
+- If the countdown reaches 0, notify the advisor and redirect back to the calendar to repick a slot.
 
 ---
 
@@ -1269,7 +1348,8 @@ WHERE t.dealership_id = :dealership_id
       SELECT 1
       FROM appointments a
       WHERE a.technician_id = t.id
-        AND a.status = 'CONFIRMED'
+        AND a.status IN ('CONFIRMED', 'PENDING')
+        AND (a.expires_at IS NULL OR a.expires_at > NOW())   -- active holds block the slot
         AND NOT (
             a.scheduled_end   <= :window_start   -- existing ends before window starts
             OR
@@ -1366,7 +1446,8 @@ SELECT technician_id, service_bay_id,
        scheduled_start, scheduled_end
 FROM   appointments
 WHERE  dealership_id = :dealership_id
-  AND  status        = 'CONFIRMED'
+  AND  status IN ('CONFIRMED', 'PENDING')
+  AND  (expires_at IS NULL OR expires_at > NOW())   -- exclude expired PENDING holds
   AND  NOT (
       scheduled_end   <= :range_start   -- appointment fully before range
       OR
@@ -1374,6 +1455,8 @@ WHERE  dealership_id = :dealership_id
   );
 ```
 
+> **Why `status IN ('CONFIRMED', 'PENDING')`:** Active PENDING holds reserve a slot just like CONFIRMED appointments — a second advisor should not be able to book the same slot while someone else has a live hold. `expires_at > NOW()` ensures expired holds (TTL elapsed, never confirmed) are automatically treated as free without requiring a cleanup job to have run first.
+>
 > **Why overlap filter instead of `scheduled_start >= :range_start`:** A point filter on `scheduled_start` would miss an appointment that started just before `range_start` but runs into the range (e.g. an appointment at 07:45 lasting 90 min would end at 09:15 and block the 08:00 slot). The overlap pattern correctly captures all appointments whose windows intersect the date range. In practice, with 08:00–18:00 business hours enforced and no cross-day appointments (A3), this edge case rarely occurs — but the query is correct by construction regardless.
 
 Hits `idx_appointments_technician_time` (partial index on `CONFIRMED` rows). Returns only the columns needed for overlap math — no joins.
@@ -1478,15 +1561,20 @@ function find_next_slot(dealership_id, service_type_id, from_time, horizon_days=
 ### 9.6 Index Strategy
 
 ```sql
--- Core availability query: technician overlap check
+-- Core availability query: technician overlap check (includes active PENDING holds)
 CREATE INDEX idx_appointments_technician_time
     ON appointments (technician_id, scheduled_start, scheduled_end)
-    WHERE status = 'CONFIRMED';
+    WHERE status IN ('CONFIRMED', 'PENDING');
 
--- Core availability query: bay overlap check
+-- Core availability query: bay overlap check (includes active PENDING holds)
 CREATE INDEX idx_appointments_bay_time
     ON appointments (service_bay_id, scheduled_start, scheduled_end)
-    WHERE status = 'CONFIRMED';
+    WHERE status IN ('CONFIRMED', 'PENDING');
+
+-- Fast expiry filtering for PENDING holds (used in every availability query)
+CREATE INDEX idx_appointments_pending_expires
+    ON appointments (expires_at)
+    WHERE status = 'PENDING';
 
 -- Technician qualification join
 CREATE INDEX idx_tech_qual_service_type
@@ -1503,7 +1591,7 @@ CREATE INDEX idx_technicians_dealership_active
     WHERE is_active = TRUE;
 ```
 
-Partial indexes (`WHERE status = 'CONFIRMED'`) exclude cancelled and completed appointments, keeping the index small and the availability queries fast.
+Partial indexes (`WHERE status IN ('CONFIRMED', 'PENDING')`) exclude cancelled, completed, and expired appointments, keeping the index small. The dedicated `idx_appointments_pending_expires` index allows the background expiry cleanup job to find and transition stale PENDING holds efficiently without a full table scan.
 
 ---
 
@@ -1542,16 +1630,16 @@ Two paths depending on whether the customer has a technician preference:
             → Customer/advisor picks preferred technician (gets technician_id)
 
   Step 2: GET /dealerships/{id}/availability?service_type_id=&from_date=&days=15
-                                             &technician_id=<uuid>
+                                             &technician_id=<int>
           → Calendar view — only shows slots where THAT technician is free
           → Slots where they are busy are excluded entirely
 
   Step 3: GET /dealerships/{id}/availability?service_type_id=&desired_start=
-                                             &technician_id=<uuid>
+                                             &technician_id=<int>
           → Spot check filtered to chosen technician
           → available: false if another booking took the slot in the interim
 
-  Step 4: POST /appointments { ..., technician_id: "uuid" }
+  Step 4: POST /appointments { ..., technician_id: <int> }
           → System validates chosen technician, assigns directly
 ```
 
@@ -1582,14 +1670,14 @@ GET /service-types?q=brake
 {
   "data": [
     {
-      "id": "uuid-...",
+      "id": "C-000001",
       "name": "Brake Inspection",
       "description": "Full brake system inspection and pad check",
       "duration_minutes": 90,
       "required_bay_type": "LIFT"
     },
     {
-      "id": "uuid-...",
+      "id": "C-000001",
       "name": "Brake Pad Replacement",
       "description": "Front or rear brake pad replacement",
       "duration_minutes": 120,
@@ -1628,8 +1716,8 @@ GET /dealerships?q=metro&limit=10
 ```json
 {
   "data": [
-    { "id": "uuid-...", "name": "Metro Honda Service Center", "city": "Austin", "state": "TX", "timezone": "America/Chicago" },
-    { "id": "uuid-...", "name": "Metro Toyota",               "city": "Austin", "state": "TX", "timezone": "America/Chicago" }
+    { "id": "C-000001", "name": "Metro Honda Service Center", "city": "Austin", "state": "TX", "timezone": "America/Chicago" },
+    { "id": "C-000001", "name": "Metro Toyota",               "city": "Austin", "state": "TX", "timezone": "America/Chicago" }
   ]
 }
 ```
@@ -1651,11 +1739,11 @@ Supports **two modes** determined by which query parameters are provided. Call t
 
 | Parameter | Type | Mode | Required | Description |
 |-----------|------|------|----------|-------------|
-| `service_type_id` | uuid | Both | Yes | The service type being booked. |
+| `service_type_id` | integer | Both | Yes | The service type being booked. |
 | `from_date` | date (YYYY-MM-DD) | Calendar | No | Start date for calendar view (default: today). |
 | `days` | integer | Calendar | No | Number of days to show (default: 15, max: 30). |
 | `desired_start` | datetime (ISO 8601) | Spot check | No | Check one specific slot and return available technicians. |
-| `technician_id` | uuid | Both | No | Filter results to a specific technician. Calendar shows only slots when that technician is free; spot check confirms whether they are available for the chosen slot. If omitted, any qualified technician is considered. |
+| `technician_id` | integer | Both | No | Filter results to a specific technician. Calendar shows only slots when that technician is free; spot check confirms whether they are available for the chosen slot. If omitted, any qualified technician is considered. |
 
 > **Mode selection:** If `desired_start` is provided → Spot Check mode. Otherwise → Calendar mode. If both `desired_start` and `from_date` are provided, `desired_start` takes precedence and `from_date` / `days` are ignored.
 >
@@ -1669,17 +1757,17 @@ Shows all free slots grouped by date for the next N days. Use this to render a b
 
 ```bash
 # No technician preference — show all open slots (any qualified tech)
-GET /dealerships/i9j0k1l2-.../availability
-  ?service_type_id=m3n4o5p6-...
+GET /dealerships/1/availability
+  ?service_type_id=2
   &from_date=2026-03-20
   &days=15
 
 # Technician-filtered — show only slots when Carlos is free
-GET /dealerships/i9j0k1l2-.../availability
-  ?service_type_id=m3n4o5p6-...
+GET /dealerships/1/availability
+  ?service_type_id=2
   &from_date=2026-03-20
   &days=15
-  &technician_id=uuid-t1
+  &technician_id=1
 ```
 
 **Response (no filter):**
@@ -1711,13 +1799,13 @@ GET /dealerships/i9j0k1l2-.../availability
 }
 ```
 
-**Response (with `technician_id=uuid-t1`):**
+**Response (with `technician_id=1`):**
 ```json
 {
   "service_type": { "name": "Brake Inspection", "duration_minutes": 90 },
   "from_date": "2026-03-20",
   "to_date": "2026-04-03",
-  "filtered_technician": { "id": "uuid-t1", "name": "Carlos Reyes" },
+  "filtered_technician": { "id": "1", "name": "Carlos Reyes" },
   "slots": [
     {
       "date": "2026-03-20",
@@ -1745,15 +1833,15 @@ After the user picks a slot from the calendar, call this to confirm the slot is 
 
 ```bash
 # No filter — returns all technicians still available for this slot
-GET /dealerships/i9j0k1l2-.../availability
-  ?service_type_id=m3n4o5p6-...
+GET /dealerships/1/availability
+  ?service_type_id=2
   &desired_start=2026-03-20T09:00:00
 
 # With filter — confirms Carlos specifically is still free for this slot
-GET /dealerships/i9j0k1l2-.../availability
-  ?service_type_id=m3n4o5p6-...
+GET /dealerships/1/availability
+  ?service_type_id=2
   &desired_start=2026-03-20T09:00:00
-  &technician_id=uuid-t1
+  &technician_id=1
 ```
 
 **Response (slot available):**
@@ -1763,8 +1851,8 @@ GET /dealerships/i9j0k1l2-.../availability
   "desired_end":   "2026-03-20T10:30:00",
   "available": true,
   "available_technicians": [
-    { "id": "uuid-t1", "name": "Carlos Reyes", "employee_number": "T-001" },
-    { "id": "uuid-t2", "name": "Maria Santos", "employee_number": "T-004" }
+    { "id": "1", "name": "Carlos Reyes", "employee_number": "T-001" },
+    { "id": "2", "name": "Maria Santos", "employee_number": "T-004" }
   ],
   "bay_available": true,
   "next_available_slot": null
@@ -1807,20 +1895,20 @@ List all active technicians at a dealership who are **qualified** for a given se
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `service_type_id` | uuid | Yes | Filter to technicians qualified to perform this service. |
+| `service_type_id` | integer | Yes | Filter to technicians qualified to perform this service. |
 
 **Example:**
 ```bash
-GET /dealerships/i9j0k1l2-.../technicians?service_type_id=m3n4o5p6-...
+GET /dealerships/1/technicians?service_type_id=2
 ```
 
 **Response:**
 ```json
 {
   "data": [
-    { "id": "uuid-t1", "name": "Carlos Reyes",  "employee_number": "T-001" },
-    { "id": "uuid-t2", "name": "Maria Santos",  "employee_number": "T-004" },
-    { "id": "uuid-t3", "name": "James Okafor",  "employee_number": "T-007" }
+    { "id": "1", "name": "Carlos Reyes",  "employee_number": "T-001" },
+    { "id": "2", "name": "Maria Santos",  "employee_number": "T-004" },
+    { "id": "3", "name": "James Okafor",  "employee_number": "T-007" }
   ]
 }
 ```
@@ -1843,13 +1931,13 @@ GET /dealerships/i9j0k1l2-.../technicians?service_type_id=m3n4o5p6-...
 
 ```json
 {
-  "customer_id":             "uuid",
-  "vehicle_id":              "uuid",
-  "dealership_id":           "uuid",
-  "service_type_id":         "uuid",
+  "customer_id":             "C-000001",
+  "vehicle_id":              "VH-000001",
+  "dealership_id":           1,
+  "service_type_id":         2,
   "desired_start":           "2026-03-20T09:00:00",
-  "technician_id":           "uuid",
-  "booked_by_customer_id":   "uuid",
+  "technician_id":           1,
+  "booked_by_customer_id":   "C-000001",
   "notes":                   "string"
 }
 ```
@@ -1865,15 +1953,93 @@ GET /dealerships/i9j0k1l2-.../technicians?service_type_id=m3n4o5p6-...
 >
 > **Idempotency (v1 risk):** v1 accepts the risk of duplicate bookings on client retry (e.g. a mobile client that times out but whose POST already committed). This is a known trade-off — keeping v1 focused on core scheduling logic. An `Idempotency-Key` header is the first hardening item post-v1 (see §14).
 
+**Response — PENDING hold created:**
+
+```json
+{
+  "id": 1,
+  "status": "PENDING",
+  "expires_at": "2026-03-20T09:10:00Z",
+  "customer": { "id": "C-000001", "name": "Jane Smith" },
+  "vehicle": { "id": "VH-000001", "vin": "1HGCM82633A123456", "year": 2022, "make": "Honda", "model": "Accord" },
+  "dealership": { "id": 1, "name": "Metro Honda Service Center" },
+  "service_type": { "id": 2, "name": "Brake Inspection", "duration_minutes": 90 },
+  "technician": { "id": 1, "name": "Carlos Reyes" },
+  "service_bay": { "id": 1, "bay_number": "Bay 4", "bay_type": "LIFT" },
+  "scheduled_start": "2026-03-20T09:00:00Z",
+  "scheduled_end":   "2026-03-20T10:30:00Z",
+  "notes": "Hearing a grinding noise from front-left wheel",
+  "created_at": "2026-03-20T09:00:00Z"
+}
+```
+
+> The frontend must display `expires_at` as a countdown timer. The advisor reviews the summary and calls `PATCH /appointments/{id}/confirm` to lock in the booking before the hold expires.
+
 **Responses:**
 
 | Code | Description |
 |------|-------------|
-| `201 Created` | Appointment confirmed. Full appointment object. |
+| `202 Accepted` | PENDING hold created. Full appointment object with `expires_at`. |
 | `400 Bad Request` | Validation failed. Field-level errors. |
 | `404 Not Found` | Referenced entity does not exist. |
 | `409 Conflict` | Technician or bay unavailable. Contains `next_available_slot`. |
 | `500 Internal Server Error` | Unexpected server error. |
+
+---
+
+### `PATCH /appointments/{appointment_id}/confirm`
+
+Confirm a PENDING soft hold, transitioning it to `CONFIRMED`. Must be called within the hold TTL (before `expires_at`).
+
+**No request body required.**
+
+**Response — confirmed:**
+```json
+{
+  "id": 1,
+  "status": "CONFIRMED",
+  "expires_at": null,
+  "scheduled_start": "2026-03-20T09:00:00Z",
+  "scheduled_end":   "2026-03-20T10:30:00Z",
+  "technician": { "id": 1, "name": "Carlos Reyes" },
+  "service_bay": { "id": 1, "bay_number": "Bay 4", "bay_type": "LIFT" }
+}
+```
+
+**Responses:**
+
+| Code | Description |
+|------|-------------|
+| `200 OK` | Appointment confirmed. `expires_at` is `null`. |
+| `404 Not Found` | No appointment with that ID. |
+| `409 Conflict` | Hold expired (`expires_at <= NOW()`). Response includes `next_available_slot`. Advisor must restart from the calendar. |
+| `422 Unprocessable Entity` | Appointment is not in `PENDING` status (already confirmed, cancelled, or expired). |
+
+---
+
+### `PATCH /appointments/{appointment_id}/cancel`
+
+Cancel a `PENDING` or `CONFIRMED` appointment. Releases the technician and bay immediately.
+
+**No request body required.**
+
+**Response:**
+```json
+{
+  "id": 1,
+  "status": "CANCELLED"
+}
+```
+
+**Responses:**
+
+| Code | Description |
+|------|-------------|
+| `200 OK` | Appointment cancelled. |
+| `404 Not Found` | No appointment with that ID. |
+| `422 Unprocessable Entity` | Appointment is `COMPLETED` — cannot cancel a completed service. |
+
+---
 
 ### `GET /customers/{customer_id}`
 
@@ -1888,17 +2054,17 @@ Get full customer profile by ID. Called after the advisor selects a customer fro
 **Examples:**
 ```bash
 # Customer only (default)
-GET /customers/a1b2c3d4-...
+GET /customers/C-000001
 
 # Customer + vehicles in one call (saves a round-trip in the booking UI)
-GET /customers/a1b2c3d4-...?include=vehicles
+GET /customers/C-000001?include=vehicles
 ```
 
 **Response (default — no `include`):**
 ```json
 {
   "customer": {
-    "id": "uuid-...",
+    "id": "C-000001",
     "first_name":    "Jane",
     "last_name":     "Smith",
     "email":         "jane@example.com",
@@ -1918,7 +2084,7 @@ GET /customers/a1b2c3d4-...?include=vehicles
 ```json
 {
   "customer": {
-    "id": "uuid-...",
+    "id": "C-000001",
     "first_name":    "Jane",
     "last_name":     "Smith",
     "email":         "jane@example.com",
@@ -1931,8 +2097,8 @@ GET /customers/a1b2c3d4-...?include=vehicles
     "country":       "US",
     "created_at":    "2025-06-01T10:00:00Z",
     "vehicles": [
-      { "id": "uuid-...", "vin": "1HGCM82633A123456", "make": "Honda", "model": "Accord", "year": 2022, "vehicle_ref": null },
-      { "id": "uuid-...", "vin": null, "vehicle_number": 42, "vehicle_ref": "V-000042", "make": "Toyota", "model": "Camry", "year": 2020 }
+      { "id": "VH-000001", "vin": "1HGCM82633A123456", "make": "Honda", "model": "Accord", "year": 2022, "vehicle_ref": null },
+      { "id": "VH-000002", "vin": null, "vehicle_number": 42, "vehicle_ref": "V-000042", "make": "Toyota", "model": "Camry", "year": 2020 }
     ]
   }
 }
@@ -1977,18 +2143,18 @@ Phone is not a hard unique constraint (see Assumption A14). If the new phone num
 **Response — no conflict:**
 ```json
 {
-  "customer": { "id": "uuid-...", "first_name": "Jane", "last_name": "Smith", "phone": "+1-555-0199", "email": "jane.new@email.com" }
+  "customer": { "id": "C-000001", "first_name": "Jane", "last_name": "Smith", "phone": "+1-555-0199", "email": "jane.new@email.com" }
 }
 ```
 
 **Response — phone already used by another customer:**
 ```json
 {
-  "customer": { "id": "uuid-...", "first_name": "Jane", "last_name": "Smith", "phone": "+1-555-0199", "email": "jane.new@email.com" },
+  "customer": { "id": "C-000001", "first_name": "Jane", "last_name": "Smith", "phone": "+1-555-0199", "email": "jane.new@email.com" },
   "warning": {
     "code": "DUPLICATE_PHONE",
     "message": "This phone number is already associated with another customer.",
-    "existing_customer": { "id": "uuid-other", "first_name": "John", "last_name": "Doe" }
+    "existing_customer": { "id": "C-000002", "first_name": "John", "last_name": "Doe" }
   }
 }
 ```
@@ -2040,14 +2206,14 @@ Register a new customer. If the phone number already exists on another record, t
 
 **Response — no conflict:**
 ```json
-{ "customer": { "id": "uuid-...", "first_name": "John", "last_name": "Doe", "email": "john.doe@email.com", "phone": "+1-555-0199" } }
+{ "customer": { "id": "C-000001", "first_name": "John", "last_name": "Doe", "email": "john.doe@email.com", "phone": "+1-555-0199" } }
 ```
 
 **Response — duplicate phone warning:**
 ```json
 {
-  "customer": { "id": "uuid-...", "first_name": "John", "last_name": "Doe", "phone": "+1-555-0199" },
-  "warning": { "code": "DUPLICATE_PHONE", "message": "This phone number is already associated with another customer.", "existing_customer": { "id": "uuid-other", "first_name": "Jane", "last_name": "Smith" } }
+  "customer": { "id": "C-000001", "first_name": "John", "last_name": "Doe", "phone": "+1-555-0199" },
+  "warning": { "code": "DUPLICATE_PHONE", "message": "This phone number is already associated with another customer.", "existing_customer": { "id": "C-000002", "first_name": "Jane", "last_name": "Smith" } }
 }
 ```
 
@@ -2063,57 +2229,54 @@ Register a new customer. If the phone number already exists on another record, t
 
 ### `GET /customers`
 
-Search customers by **phone number** (exact match) or **name** (partial, typeahead). Exactly one of `phone` or `q` must be provided.
-
-> **Why phone is preferred:** Phone is the fastest lookup path — it is an exact match and typically returns 1 result. However, because phone is not a hard unique constraint (see Assumption A14), multiple customers can share a number (e.g. spouses). When the phone lookup returns multiple results, the advisor disambiguates by reviewing the names returned.
+Search customers by **name or phone** using a single unified `q` parameter. The query is matched against `first_name`, `last_name`, full name, and `phone` in one SQL query — the advisor does not need to know in advance whether they are searching by name or number.
 
 **Query parameters:**
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `phone` | string | One of | Exact phone number lookup. Usually returns 1 result; may return multiple if the number is shared (e.g. family). Takes priority over `q` if both are provided. |
-| `q` | string | One of | Partial name search (min 2 characters). Matches `first_name`, `last_name`, or full name. |
-| `limit` | integer | No | Max results for name search (default: 10, max: 20). Ignored when `phone` is used. |
+| `q` | string | Yes | Partial match (min 2 characters). Searched across `first_name`, `last_name`, full name (`first + last`), and `phone`. |
+| `limit` | integer | No | Max results (default: 10, max: 20). |
+| `cursor` | string | No | Opaque cursor for pagination (base64-encoded last seen ID). |
 
 **Implementation logic:**
 
 ```python
-if phone:
-    customers = customer_repo.get_by_phone(phone)  # exact match, returns 0, 1, or many (shared phone)
-    return customers
-elif q:
-    return customer_repo.search_by_name(q, limit)  # ILIKE partial match
-else:
-    abort(400, "Either 'phone' or 'q' is required")
+pattern = f"%{q}%"
+customers = customer_repo.search_by_any(q, limit)
+# SQL: WHERE first_name ILIKE ? OR last_name ILIKE ?
+#        OR CONCAT(first_name, ' ', last_name) ILIKE ?
+#        OR phone ILIKE ?
+#      ORDER BY id LIMIT n
 ```
 
-**Example — phone lookup (primary, precise):**
+**Example — search by name:**
 ```bash
-GET /customers?phone=+1-555-0101
+GET /customers?q=smith&limit=10
 ```
+
+**Example — search by phone:**
+```bash
+GET /customers?q=%2B1-555-0101&limit=10
+```
+
 ```json
 {
   "data": [
     {
-      "id": "uuid-...", "first_name": "Jane", "last_name": "Smith",
+      "id": "C-000001", "first_name": "Jane", "last_name": "Smith",
       "email": "jane@example.com", "phone": "+1-555-0101",
       "address_line1": "123 Main St", "city": "Springfield", "state": "IL",
       "postal_code": "62701", "country": "US"
+    },
+    {
+      "id": "C-000002", "first_name": "John", "last_name": "Smithson",
+      "email": "john@example.com", "phone": "+1-555-0102",
+      "address_line1": null, "city": null, "state": null,
+      "postal_code": null, "country": "US"
     }
-  ]
-}
-```
-
-**Example — name search (fallback, typeahead):**
-```bash
-GET /customers?q=smi&limit=10
-```
-```json
-{
-  "data": [
-    { "id": "uuid-...", "first_name": "Jane", "last_name": "Smith",    "email": "jane@example.com",  "phone": "+1-555-0101", "city": "Springfield", "country": "US" },
-    { "id": "uuid-...", "first_name": "John", "last_name": "Smithson", "email": "john@example.com",  "phone": "+1-555-0102", "city": null, "country": "US" }
-  ]
+  ],
+  "next_cursor": null
 }
 ```
 
@@ -2122,7 +2285,7 @@ GET /customers?q=smi&limit=10
 | Code | Description |
 |------|-------------|
 | `200 OK` | Results returned (empty array if no match) |
-| `400 Bad Request` | Neither `phone` nor `q` provided; or `q` is fewer than 2 characters |
+| `400 Bad Request` | `q` not provided or fewer than 2 characters |
 
 ---
 
@@ -2133,7 +2296,7 @@ Register a new vehicle. If a vehicle with the same VIN already exists, returns `
 **Request body:**
 ```json
 {
-  "customer_id": "uuid-...",
+  "customer_id": "C-000001",
   "vin":         "1HGCM82633A123456",
   "make":        "Honda",
   "model":       "Accord",
@@ -2141,20 +2304,20 @@ Register a new vehicle. If a vehicle with the same VIN already exists, returns `
 }
 ```
 
-> `vin` is optional — vehicles can be registered and booked without a VIN (see Assumption A15). All booking operations use `vehicle_id` (UUID).
+> `vin` is optional — vehicles can be registered and booked without a VIN (see Assumption A15). All booking operations use `vehicle_id` (`VH-XXXXXX` format).
 
 **Response (vehicle with VIN):**
 ```json
 {
   "vehicle": {
-    "id": "uuid-...",
+    "id": "VH-000001",
     "vehicle_number": null,
     "vehicle_ref": null,
     "vin": "1HGCM82633A123456",
     "make": "Honda",
     "model": "Accord",
     "year": 2022,
-    "customer_id": "uuid-..."
+    "customer_id": "C-000001"
   }
 }
 ```
@@ -2163,14 +2326,14 @@ Register a new vehicle. If a vehicle with the same VIN already exists, returns `
 ```json
 {
   "vehicle": {
-    "id": "uuid-...",
+    "id": "VH-000002",
     "vehicle_number": 42,
     "vehicle_ref": "V-000042",
     "vin": null,
     "make": "Toyota",
     "model": "Camry",
     "year": 2020,
-    "customer_id": "uuid-..."
+    "customer_id": "C-000001"
   }
 }
 ```
@@ -2196,12 +2359,12 @@ Single endpoint for vehicle lookup. The `identifier` path parameter is **auto-de
 
 | Priority | Format | Pattern | Lookup column |
 |----------|--------|---------|---------------|
-| 1 | UUID | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` (8-4-4-4-12 hex) | `vehicle.id` |
+| 1 | Numeric / `VH-XXXXXX` | Plain integer or `VH-` prefixed zero-padded ref (e.g. `VH-000001`) | `vehicle.id` |
 | 2 | VIN | Exactly 17 chars `[A-HJ-NPR-Z0-9]` | `vehicle.vin` |
 | 3 | V-XXXXXX ref | `V-` + 1–10 digits (case-insensitive), e.g. `V-000042` | `vehicle.vehicle_number` |
 | — | Anything else | — | `400 Bad Request` |
 
-> **Why three lookup paths?** UUID is the internal system identifier and is always present. VIN is the standard automotive identifier when known. `V-XXXXXX` fills the operational gap: when a vehicle is registered without a VIN (e.g. awaiting delivery, customer doesn't know it), staff need a short stable reference they can verbally communicate — a UUID is impractical. The `V-XXXXXX` reference is printed on job cards and stored in the advisor's CRM notes.
+> **Why three lookup paths?** The numeric `VH-XXXXXX` ID is the primary system identifier and is always present. VIN is the standard automotive identifier when known. `V-XXXXXX` fills the operational gap: when a vehicle is registered without a VIN (e.g. awaiting delivery, customer doesn't know it), staff need a short stable reference they can verbally communicate — `V-XXXXXX` is printed on job cards and stored in the advisor's CRM notes.
 
 > **VIN format note:** VIN characters exclude `I`, `O`, and `Q` to avoid confusion with `1`, `0`. The regex `[A-HJ-NPR-Z0-9]` enforces this.
 
@@ -2211,8 +2374,8 @@ Single endpoint for vehicle lookup. The `identifier` path parameter is **auto-de
 # Lookup by VIN
 GET /vehicles/1HGCM82633A123456
 
-# Lookup by UUID
-GET /vehicles/e5f6g7h8-0000-0000-0000-000000000001
+# Lookup by numeric ID or VH-XXXXXX ref
+GET /vehicles/VH-000001
 
 # Lookup by V-XXXXXX reference (vehicle without VIN)
 GET /vehicles/V-000042
@@ -2223,14 +2386,14 @@ GET /vehicles/v-000042   # case-insensitive
 
 ```json
 {
-  "id": "uuid-...",
+  "id": "VH-000002",
   "vehicle_number": 42,
   "vehicle_ref": "V-000042",
   "vin": null,
   "make": "Toyota",
   "model": "Camry",
   "year": 2020,
-  "customer_id": "uuid-..."
+  "customer_id": "C-000001"
 }
 ```
 
@@ -2239,14 +2402,14 @@ GET /vehicles/v-000042   # case-insensitive
 > - `vehicle_ref`: formatted display string `"V-000042"` (`null` for VIN vehicles). Computed by the serialisation layer — not stored in DB.
 > - VIN vehicles return `"vehicle_number": null, "vehicle_ref": null`.
 
-> **Booking with no VIN:** A vehicle registered without a VIN **can still be booked** — all booking operations use `vehicle_id` (UUID). VIN and `vehicle_ref` are lookup/display fields only. VIN can be assigned later via the future `PATCH /vehicles/{vehicle_id}/vin` endpoint (see §14).
+> **Booking with no VIN:** A vehicle registered without a VIN **can still be booked** — all booking operations use `vehicle_id` (`VH-XXXXXX` format). VIN and `vehicle_ref` are lookup/display fields only. VIN can be assigned later via the future `PATCH /vehicles/{vehicle_id}/vin` endpoint (see §14).
 
 **Responses:**
 
 | Code | Description |
 |------|-------------|
 | `200 OK` | Vehicle found |
-| `400 Bad Request` | Identifier does not match UUID, 17-char VIN, or V-XXXXXX format |
+| `400 Bad Request` | Identifier does not match numeric/VH-XXXXXX ID, 17-char VIN, or V-XXXXXX format |
 | `404 Not Found` | No vehicle found for the given identifier |
 
 ---
@@ -2262,7 +2425,7 @@ Common use cases:
 **Request body (all fields optional):**
 ```json
 {
-  "customer_id": "new-owner-uuid",
+  "customer_id": "C-000003",
   "make":        "Honda",
   "model":       "Civic",
   "year":        2023
@@ -2274,16 +2437,12 @@ Common use cases:
 **Response:**
 ```json
 {
-  "id": "uuid-...",
+  "id": "VH-000001",
   "vin": "1HGCM82633A123456",
   "make": "Honda",
   "model": "Civic",
   "year": 2023,
-  "customer": {
-    "id": "new-owner-uuid",
-    "first_name": "John",
-    "last_name": "Doe"
-  }
+  "customer_id": "C-000003"
 }
 ```
 
@@ -2312,8 +2471,8 @@ All log output is structured JSON emitted to `stdout`. Standard fields on every 
   "logger": "app.services.appointment_service",
   "message": "Appointment confirmed",
   "request_id": "req-abc123",
-  "appointment_id": "uuid-...",
-  "dealership_id": "uuid-...",
+  "appointment_id": 1,
+  "dealership_id": 1,
   "duration_ms": 47
 }
 ```
@@ -2735,7 +2894,7 @@ AI identified the TOCTOU race condition and suggested the advisory lock pattern.
 
 **Index Strategy**
 
-The AI was given the availability query shapes and suggested the partial index pattern (`WHERE status = 'CONFIRMED'`), verified against PostgreSQL documentation before inclusion. `PENDING` was explicitly excluded — the system transitions appointments directly to `CONFIRMED` on creation (see Assumption A12).
+The AI was given the availability query shapes and suggested the partial index pattern (originally `WHERE status = 'CONFIRMED'`), verified against PostgreSQL documentation before inclusion. When PENDING soft holds were introduced in v1.3, the index condition was updated to `WHERE status IN ('CONFIRMED', 'PENDING')` — see §13.2 Index Strategy Update.
 
 ---
 
@@ -2744,6 +2903,10 @@ The AI was given the availability query shapes and suggested the partial index p
 The AI proposed specific metric names and explained why high-cardinality labels (e.g., `appointment_id`) must be excluded from Prometheus metrics. The `appointment_id` label was explicitly removed from all metric definitions as a result.
 
 ---
+
+**Index Strategy Update (v1.3 — PENDING soft hold)**
+
+When the PENDING status was added, the AI was asked to review the impact on existing partial indexes. It correctly identified that `WHERE status = 'CONFIRMED'` indexes would miss PENDING rows, causing the availability overlap check to return false positives (showing a slot as free when a live PENDING hold exists). Indexes were updated to `WHERE status IN ('CONFIRMED', 'PENDING')` and a dedicated `idx_appointments_pending_expires` index was added for efficient TTL cleanup queries.
 
 ---
 
@@ -2757,7 +2920,7 @@ After the initial draft was complete, the AI was asked to perform a full intervi
 
 AI flagged a direct contradiction between Assumption A15 ("VIN is optional — system supports booking for vehicles with or without a VIN") and a note in the `GET /vehicles/{identifier}` API spec that stated a no-VIN vehicle "cannot be used to book a service appointment."
 
-*Resolution (human decision):* A15 is correct. The note was wrong — removed and replaced with a clarification that `vehicle_id` (UUID) is always the booking identifier; VIN is lookup/display only. Real-world rationale: a customer calling in to book may not know their VIN; the advisor registers the vehicle and books using the system UUID.
+*Resolution (human decision):* A15 is correct. The note was wrong — removed and replaced with a clarification that `vehicle_id` (`VH-XXXXXX` format) is always the booking identifier; VIN is lookup/display only. Real-world rationale: a customer calling in to book may not know their VIN; the advisor registers the vehicle and books using the system ID.
 
 ---
 
@@ -2792,7 +2955,7 @@ Scoping by date (not by exact time) ensures that two concurrent bookings for the
 
 AI reviewed the full sequence diagram and found:
 - Step 0 (Dealership search) called `DealershipRepository` directly from the route layer, bypassing the service layer — inconsistent with all other steps.
-- Vehicle lookup SQL showed `WHERE id=? OR vin=?` — incorrect, as UUID and VIN lookups are separate queries routed by identifier format.
+- Vehicle lookup SQL showed `WHERE id=? OR vin=?` — incorrect, as numeric ID and VIN lookups are separate queries routed by identifier format.
 - Spot check response hardcoded `available: true` — should be a generic field reflecting actual availability.
 - Advisory lock in the diagram still showed the old coarse single-lock pattern after Issue 3 was fixed.
 
@@ -2828,14 +2991,82 @@ AI reviewed the full sequence diagram and found:
 | Soft delete / audit trail | Medium | `deleted_at` timestamps; append-only `AppointmentEvent` log |
 | Pre-computed availability cache | Low | Redis sorted set of open slots for high-volume scenarios |
 | Waitlist | Low | Register interest when no slot found within horizon |
-| **VIN assignment** (`PATCH /vehicles/{vehicle_id}/vin`) | **Medium** | Assign or update a VIN on an existing vehicle record. Not implemented in v1. Vehicles without VIN can be registered, looked up by UUID, and booked normally — VIN is a lookup/display field only (see Assumption A15). |
+| **VIN assignment** (`PATCH /vehicles/{vehicle_id}/vin`) | **Medium** | Assign or update a VIN on an existing vehicle record. Not implemented in v1. Vehicles without VIN can be registered, looked up by `VH-XXXXXX` ID, and booked normally — VIN is a lookup/display field only (see Assumption A15). |
 | **Idempotency key** (`Idempotency-Key` header on `POST /appointments`) | **High** | If a client times out after POST but the DB already committed, a retry creates a duplicate appointment. An `Idempotency-Key` header (UUID per request) stored in Redis/DB with the response allows replaying the same response on retry. Critical for mobile clients on flaky networks. |
-| **Soft hold / temporary reservation** | **Medium** | Between spot check (Step 0d-2) and POST /appointments, a race can steal the slot. A Redis-backed ephemeral hold (TTL 2–5 min) reserves the slot while the advisor completes the form. Expired holds release automatically. Adds complexity; v1 handles the race via atomic re-check + `next_available_slot` fallback. |
+| **~~Soft hold / temporary reservation~~** | ~~Medium~~ | **Implemented in v1.3** as the PENDING two-phase booking flow. See A12, A23, and §8.6. `POST /appointments` creates a PENDING hold (10-min TTL); `PATCH /confirm` transitions to CONFIRMED. |
 | **Operational workflow states** | **Medium** | Add `CHECKED_IN`, `IN_PROGRESS`, `NO_SHOW` statuses for workshop management. Belongs to a separate operational domain, out of scope for the booking assessment. |
 | **`DealershipSchedule` entity** | **Medium** | Per-dealership custom schedules to replace the hardcoded 08:00–18:00 global default (see A3). Covers different hours, closed days, 24/7 operations. Requires a `DealershipSchedule` entity linked to `Dealership`. |
 | **Appointment read & cancel endpoints** (`GET /appointments`, `GET /appointments/{id}`, `DELETE /appointments/{id}`) | **Medium** | Read and cancel operations listed as planned routes in §4.1. Not implemented in v1 — booking creation is the assessed scope. Cancel is modelled as status transition `CONFIRMED → CANCELLED`. |
 | **Reschedule endpoint** (`POST /appointments/{id}/reschedule`) | **Low** | Convenience wrapper around cancel + re-book in a single atomic operation. v1 clients achieve the same by calling `DELETE` then `POST /appointments`. |
 | **`booked_by_customer_id` from auth session** | **High** | Currently accepted as an optional field in the request body defaulting to `customer_id`. Once JWT auth (above) is implemented, this should be populated server-side from the token and removed from the client payload entirely. |
+
+---
+
+## 15. CI/CD Pipeline
+
+### 15.1 Current Implementation
+
+The project uses **GitHub Actions** for continuous integration. The pipeline runs automatically on every push and pull request to any branch.
+
+**Workflow:** `.github/workflows/ci.yml`
+
+```
+Push / PR → Build Docker image (test stage) → Run Alembic migrations → Run pytest
+```
+
+#### Pipeline steps
+
+| Step | Description |
+|------|-------------|
+| **Checkout** | Clone repository |
+| **Build test image** | `docker build --target test` — uses the `test` stage in the multi-stage Dockerfile |
+| **Run migrations** | `alembic upgrade head` against a live PostgreSQL service container |
+| **Run tests** | `pytest tests/ -v --tb=short` inside the container |
+
+#### PostgreSQL service container
+
+GitHub Actions spins up a `postgres:15-alpine` container as a service before any steps run. The test container connects to it via `--network host` with `TEST_DATABASE_URL` injected as an environment variable.
+
+```yaml
+services:
+  postgres:
+    image: postgres:15-alpine
+    env:
+      POSTGRES_DB: scheduler_test
+    options: --health-cmd "pg_isready" ...   # steps only start after DB is ready
+```
+
+#### Branch protection
+
+Pull requests **must pass CI** before they can be merged. PRs also require **at least one approval** before merge. This ensures:
+- No broken code reaches `main`
+- All schema migrations are valid against a real PostgreSQL instance
+- A second set of eyes reviews every change
+
+### 15.2 Local Equivalents
+
+Developers can replicate the CI environment locally:
+
+```bash
+# Fast (SQLite, no infrastructure)
+docker compose --profile test run --rm test
+
+# Full (PostgreSQL, mirrors CI exactly)
+docker compose --profile test-pg run --rm test-pg
+```
+
+### 15.3 Future: Automated Deployment
+
+Automated deployment is not implemented in v1 but is planned. The intended approach:
+
+| Stage | Tool | Trigger |
+|-------|------|---------|
+| Build & push image | Docker Hub / GHCR | On merge to `main` |
+| Deploy to staging | Docker Compose / Kubernetes | After image push |
+| Smoke test | `curl /health` + subset of integration tests | After deploy |
+| Deploy to production | Manual approval gate or auto on staging pass | After staging green |
+
+The multi-stage Dockerfile (`builder` → `runtime` / `test`) is already structured to support this — the `runtime` stage produces a minimal production image with no test dependencies.
 
 ---
 

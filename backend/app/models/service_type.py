@@ -1,10 +1,12 @@
 from app.extensions import db
 
+_BigInt = db.BigInteger().with_variant(db.Integer, "sqlite")
+
 
 class ServiceType(db.Model):
     __tablename__ = "service_types"
 
-    id                = db.Column(db.BigInteger, primary_key=True, autoincrement=True)
+    id                = db.Column(_BigInt, primary_key=True, autoincrement=True)
     name              = db.Column(db.String(255), nullable=False)
     description       = db.Column(db.Text, nullable=True)
     duration_minutes  = db.Column(db.Integer, nullable=False)

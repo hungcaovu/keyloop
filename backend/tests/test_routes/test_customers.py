@@ -102,14 +102,14 @@ class TestGetCustomer:
         assert resp.status_code == 404
 
     def test_search_by_phone(self, client, db, customer):
-        # Use query_string dict so Flask test client properly encodes '+' as '%2B'
-        resp = client.get("/customers", query_string={"phone": "+1-555-0101"})
+        # phone search is done via q= (merged into unified search)
+        resp = client.get("/customers", query_string={"q": "+1-555-0101"})
         assert resp.status_code == 200
         body = resp.get_json()
         assert len(body["data"]) == 1
 
     def test_search_without_params_returns_400(self, client, db):
-        """Design: either phone or q is required."""
+        """Design: q is required."""
         resp = client.get("/customers")
         assert resp.status_code == 400
 
