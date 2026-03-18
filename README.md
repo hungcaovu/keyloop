@@ -1,4 +1,4 @@
-# KeeyLoop — Unified Service Scheduler
+# KeyLoop — Unified Service Scheduler
 
 **Scenario A** of the Keyloop Technical Assessment.
 A full-stack appointment booking system for automotive dealerships — replacing manual scheduling with real-time, concurrent-safe resource booking.
