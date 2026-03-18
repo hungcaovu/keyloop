@@ -71,10 +71,10 @@ class AppointmentSchema(Schema):
     service_type          = fields.Nested(_ServiceTypeBriefSchema)
     technician            = fields.Nested(_TechnicianBriefSchema)
     service_bay           = fields.Nested(_ServiceBayBriefSchema)
-    scheduled_start       = fields.DateTime()
-    scheduled_end         = fields.DateTime()
+    scheduled_start       = fields.DateTime(format='%Y-%m-%dT%H:%M:%SZ')
+    scheduled_end         = fields.DateTime(format='%Y-%m-%dT%H:%M:%SZ')
     notes                 = fields.Str(allow_none=True)
-    created_at            = fields.DateTime(dump_only=True)
+    created_at            = fields.DateTime(format='%Y-%m-%dT%H:%M:%SZ', dump_only=True)
 
     class Meta:
         unknown = EXCLUDE

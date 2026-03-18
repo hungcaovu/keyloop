@@ -4,17 +4,17 @@ Vehicle reference number utilities.
 
 For vehicles without a VIN, `vehicle_number` (auto-increment BigInt) provides
 a human-readable reference. It is stored as an integer in the DB for performance
-(8-byte integer index vs 36-char UUID string index).
+(8-byte integer index vs variable-length string index).
 
 Encoding: zero-padded 6-digit string prefixed with "V-".
   vehicle_number=1   → "V-000001"
   vehicle_number=999 → "V-000999"
 
 Lookup path in GET /vehicles/{identifier}:
-  1. UUID pattern           → lookup by vehicle.id
-  2. 17-char VIN            → lookup by vehicle.vin
-  3. V-XXXXXX pattern       → lookup by vehicle.vehicle_number
-  4. Anything else          → 400 Bad Request
+  1. Numeric ID or VH-XXXXXX ref → lookup by vehicle.id
+  2. 17-char VIN                 → lookup by vehicle.vin
+  3. V-XXXXXX pattern            → lookup by vehicle.vehicle_number
+  4. Anything else               → 400 Bad Request
 """
 
 import re

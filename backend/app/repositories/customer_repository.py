@@ -20,6 +20,26 @@ class CustomerRepository:
             ).scalars().all()
         )
 
+    def search_by_any(self, q: str, limit: int = 10, after_id: int | None = None) -> list[Customer]:
+        """Search across first_name, last_name, full name, and phone with a single query."""
+        pattern = f"%{q}%"
+        stmt = (
+            db.select(Customer)
+            .where(
+                or_(
+                    Customer.first_name.ilike(pattern),
+                    Customer.last_name.ilike(pattern),
+                    func.concat(Customer.first_name, " ", Customer.last_name).ilike(pattern),
+                    Customer.phone.ilike(pattern),
+                )
+            )
+            .order_by(Customer.id)
+        )
+        if after_id is not None:
+            stmt = stmt.where(Customer.id > after_id)
+        stmt = stmt.limit(limit)
+        return list(db.session.execute(stmt).scalars().all())
+
     def search_by_name(self, q: str, limit: int = 10, after_id: int | None = None) -> list[Customer]:
         pattern = f"%{q}%"
         stmt = (

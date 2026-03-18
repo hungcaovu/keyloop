@@ -34,7 +34,7 @@ SPEC: dict = {
             "Customer": {
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "format": "uuid", "readOnly": True},
+                    "id": {"type": "integer", "readOnly": True},
                     "first_name": {"type": "string"},
                     "last_name": {"type": "string"},
                     "email": {"type": "string", "format": "email"},
@@ -82,8 +82,8 @@ SPEC: dict = {
             "Vehicle": {
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "format": "uuid", "readOnly": True},
-                    "customer_id": {"type": "string", "format": "uuid"},
+                    "id": {"type": "integer", "readOnly": True},
+                    "customer_id": {"type": "integer"},
                     "vehicle_number": {"type": ["integer", "null"], "readOnly": True},
                     "vehicle_ref": {
                         "type": ["string", "null"],
@@ -104,7 +104,7 @@ SPEC: dict = {
                 "type": "object",
                 "required": ["customer_id", "make", "model", "year"],
                 "properties": {
-                    "customer_id": {"type": "string", "format": "uuid"},
+                    "customer_id": {"type": "integer"},
                     "vin": {"type": "string", "maxLength": 17},
                     "make": {"type": "string", "maxLength": 100},
                     "model": {"type": "string", "maxLength": 100},
@@ -116,14 +116,14 @@ SPEC: dict = {
             "Appointment": {
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "format": "uuid", "readOnly": True},
-                    "dealership_id": {"type": "string", "format": "uuid"},
-                    "customer_id": {"type": "string", "format": "uuid"},
-                    "vehicle_id": {"type": "string", "format": "uuid"},
-                    "technician_id": {"type": ["string", "null"], "format": "uuid"},
-                    "bay_id": {"type": ["string", "null"], "format": "uuid"},
-                    "service_type_id": {"type": "string", "format": "uuid"},
-                    "booked_by_customer_id": {"type": ["string", "null"], "format": "uuid"},
+                    "id": {"type": "integer", "readOnly": True},
+                    "dealership_id": {"type": "integer"},
+                    "customer_id": {"type": "integer"},
+                    "vehicle_id": {"type": "integer"},
+                    "technician_id": {"type": ["integer", "null"]},
+                    "bay_id": {"type": ["integer", "null"]},
+                    "service_type_id": {"type": "integer"},
+                    "booked_by_customer_id": {"type": ["integer", "null"]},
                     "start_time": {"type": "string", "format": "date-time"},
                     "end_time": {"type": "string", "format": "date-time"},
                     "status": {
@@ -138,16 +138,16 @@ SPEC: dict = {
                 "type": "object",
                 "required": ["dealership_id", "customer_id", "vehicle_id", "service_type_id", "start_time"],
                 "properties": {
-                    "dealership_id": {"type": "string", "format": "uuid"},
-                    "customer_id": {"type": "string", "format": "uuid"},
+                    "dealership_id": {"type": "integer"},
+                    "customer_id": {"type": "integer"},
                     "vehicle_id": {
                         "type": "string",
-                        "description": "UUID, 17-char VIN, or V-XXXXXX vehicle ref",
+                        "description": "Integer ID, VH-XXXXXX, 17-char VIN, or V-XXXXXX vehicle ref",
                     },
-                    "service_type_id": {"type": "string", "format": "uuid"},
+                    "service_type_id": {"type": "integer"},
                     "start_time": {"type": "string", "format": "date-time"},
-                    "technician_id": {"type": "string", "format": "uuid"},
-                    "booked_by_customer_id": {"type": "string", "format": "uuid"},
+                    "technician_id": {"type": "integer"},
+                    "booked_by_customer_id": {"type": "integer"},
                     "notes": {"type": "string"},
                 },
             },
@@ -156,14 +156,14 @@ SPEC: dict = {
                 "properties": {
                     "start": {"type": "string", "format": "date-time"},
                     "end": {"type": "string", "format": "date-time"},
-                    "technician_id": {"type": "string", "format": "uuid"},
-                    "bay_id": {"type": "string", "format": "uuid"},
+                    "technician_id": {"type": "integer"},
+                    "bay_id": {"type": "integer"},
                 },
             },
             "Dealership": {
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "format": "uuid"},
+                    "id": {"type": "integer"},
                     "name": {"type": "string"},
                     "timezone": {"type": "string", "example": "America/Chicago"},
                     "business_hours_start": {"type": "string", "example": "08:00"},
@@ -176,7 +176,7 @@ SPEC: dict = {
             "ServiceType": {
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "format": "uuid"},
+                    "id": {"type": "integer"},
                     "name": {"type": "string"},
                     "duration_minutes": {"type": "integer"},
                     "bay_type": {"type": "string"},
@@ -411,7 +411,7 @@ SPEC: dict = {
         "/vehicles/{identifier}": {
             "get": {
                 "tags": ["vehicles"],
-                "summary": "Get vehicle by UUID, VIN, or V-XXXXXX ref",
+                "summary": "Get vehicle by ID, VIN, or V-XXXXXX ref",
                 "operationId": "get_vehicle",
                 "parameters": [
                     {
@@ -419,7 +419,7 @@ SPEC: dict = {
                         "in": "path",
                         "required": True,
                         "schema": {"type": "string"},
-                        "description": "UUID (36-char), VIN (17-char), or V-XXXXXX vehicle reference",
+                        "description": "Numeric ID (or VH-XXXXXX format), VIN (17-char), or V-XXXXXX vehicle reference",
                     }
                 ],
                 "responses": {

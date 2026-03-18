@@ -16,6 +16,10 @@ class CustomerService:
             return self.repo.search_by_name(q, limit=limit, after_id=after_id)
         return []
 
+    def search_any(self, q: str, limit: int = 10, after_id: int | None = None) -> list[Customer]:
+        """Search across name + phone in a single query."""
+        return self.repo.search_by_any(q, limit=limit, after_id=after_id)
+
     def get_by_id(self, customer_id: str) -> Customer:
         customer = self.repo.get_by_id(customer_id)
         if not customer:

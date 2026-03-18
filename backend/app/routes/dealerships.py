@@ -79,7 +79,7 @@ def search_dealerships():
 @dealerships_bp.route("/<string:dealership_id>/technicians", methods=["GET"])
 def list_technicians(dealership_id):
     """
-    GET /dealerships/{dealership_id}/technicians?service_type_id=<uuid>
+    GET /dealerships/{dealership_id}/technicians?service_type_id=<id>
 
     Step 0c.5 — list qualified technicians so advisor/customer can pre-select one.
     """
@@ -163,8 +163,8 @@ def get_availability(dealership_id):
                         "date": day.date,
                         "available_times": [
                             {
-                                "start": slot.start.isoformat(),
-                                "end": slot.end.isoformat(),
+                                "start": slot.start.isoformat() + "Z",
+                                "end": slot.end.isoformat() + "Z",
                                 "technician_count": slot.technician_count,
                             }
                             for slot in day.available_times

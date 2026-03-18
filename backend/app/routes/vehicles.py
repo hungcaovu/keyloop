@@ -24,7 +24,7 @@ def get_service():
 def get_vehicle(identifier):
     """
     GET /vehicles/{identifier}
-    Auto-detects: UUID → lookup by id, 17-char alphanumeric → lookup by VIN.
+    Auto-detects: numeric/VH-XXXXXX → lookup by id, 17-char alphanumeric → lookup by VIN, V-XXXXXX → lookup by vehicle_number.
     """
     logger.info("Get vehicle: identifier=%s", identifier)
     try:

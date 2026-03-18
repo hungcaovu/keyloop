@@ -60,7 +60,7 @@ class TestGetCustomer:
         assert "vehicles" not in body["customer"]
 
     def test_get_by_id_not_found(self, client, db):
-        resp = client.get("/customers/00000000-0000-0000-0000-000000000000")
+        resp = client.get("/customers/999999")
         assert resp.status_code == 404
 
     def test_include_vehicles_empty(self, client, db, customer):
@@ -133,7 +133,7 @@ class TestPatchCustomer:
 
     def test_update_not_found(self, client, db):
         resp = client.patch(
-            "/customers/00000000-0000-0000-0000-000000000000",
+            "/customers/999999",
             json={"first_name": "X"},
         )
         assert resp.status_code == 404

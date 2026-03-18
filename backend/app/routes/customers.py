@@ -40,33 +40,27 @@ def get_service():
 @customers_bp.route("", methods=["GET"])
 def search_customers():
     """
-    GET /customers?phone=+1-555-0101
-    GET /customers?q=smith&limit=10
+    GET /customers?q=smith          — search across name + phone
+    GET /customers?q=+1-555-0101    — same endpoint, phone is just another field
     """
-    phone  = request.args.get("phone")
     q      = request.args.get("q")
     limit  = int(request.args.get("limit", 10))
     cursor = request.args.get("cursor")
 
-    if not phone and not q:
-        return jsonify({"error": "Either 'phone' or 'q' query parameter is required."}), 400
+    if not q:
+        return jsonify({"error": "Query parameter 'q' is required."}), 400
 
-    if q and len(q) < 2:
+    if len(q) < 2:
         return jsonify({"error": "Query 'q' must be at least 2 characters."}), 400
 
-    # cursor only applies to name search (phone search is exact match, no pagination needed)
-    after_id = _decode_cursor(cursor) if (cursor and q) else None
+    after_id = _decode_cursor(cursor) if cursor else None
 
-    logger.info("Search customers: phone=%s q=%s limit=%s after_id=%s", phone, q, limit, after_id)
-    items = get_service().search(phone=phone, q=q, limit=limit + 1, after_id=after_id)
+    logger.info("Search customers: q=%s limit=%s after_id=%s", q, limit, after_id)
+    items = get_service().search_any(q, limit=limit + 1, after_id=after_id)
 
-    if q:
-        has_more    = len(items) > limit
-        items       = items[:limit]
-        next_cursor = _encode_cursor(items[-1].id) if has_more and items else None
-    else:
-        has_more    = False
-        next_cursor = None
+    has_more    = len(items) > limit
+    items       = items[:limit]
+    next_cursor = _encode_cursor(items[-1].id) if has_more and items else None
 
     logger.info("Search customers result: %d found has_more=%s", len(items), has_more)
     return jsonify({"data": CustomerSchema(many=True).dump(items), "next_cursor": next_cursor}), 200

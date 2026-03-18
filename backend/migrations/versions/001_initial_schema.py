@@ -2,7 +2,7 @@
 service_types, technicians, service_bays, appointments).
 
 Includes:
-  - BigInteger auto-increment PKs (no UUIDs)
+  - BigInteger auto-increment PKs
   - vehicle_number (BigInt surrogate ref for VIN-less vehicles)
   - customer address fields (address_line1/2, city, state, postal_code, country)
   - email is indexed but NOT unique (duplicates allowed)

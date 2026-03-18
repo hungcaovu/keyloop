@@ -178,12 +178,11 @@ class AvailabilityService:
             )
 
             if free_tech_count > 0 and any_free_bay:
-                local_start = cursor.replace(tzinfo=timezone.utc).astimezone(tz)
-                local_end   = window_end.replace(tzinfo=timezone.utc).astimezone(tz)
-                slots_by_date[local_start.date()].append(
+                local_date = cursor.replace(tzinfo=timezone.utc).astimezone(tz).date()
+                slots_by_date[local_date].append(
                     TimeSlot(
-                        start=local_start.replace(tzinfo=None),
-                        end=local_end.replace(tzinfo=None),
+                        start=cursor,       # UTC naive — matches what POST /appointments expects
+                        end=window_end,     # UTC naive
                         technician_count=free_tech_count,
                     )
                 )

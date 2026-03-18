@@ -36,15 +36,15 @@ class TestGetVehicle:
         assert resp.status_code == 404
 
     def test_invalid_identifier_returns_400(self, client, db):
-        resp = client.get("/vehicles/not-a-vin-or-uuid")
+        resp = client.get("/vehicles/not-a-valid-identifier")
         assert resp.status_code == 400
 
     def test_vin_not_found_returns_404(self, client, db):
         resp = client.get("/vehicles/ZZZZZZZZZZZZZZZZZ")
         assert resp.status_code == 404
 
-    def test_uuid_not_found_returns_404(self, client, db):
-        resp = client.get("/vehicles/00000000-0000-0000-0000-000000000000")
+    def test_nonexistent_id_returns_404(self, client, db):
+        resp = client.get("/vehicles/999999")
         assert resp.status_code == 404
 
 
@@ -147,7 +147,7 @@ class TestPatchVehicle:
 
     def test_update_not_found(self, client, db):
         resp = client.patch(
-            "/vehicles/00000000-0000-0000-0000-000000000000",
+            "/vehicles/999999",
             json={"year": 2023},
         )
         assert resp.status_code == 404
