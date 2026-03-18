@@ -23,6 +23,7 @@
 12. [Deployment & Scalability](#12-deployment--scalability)
 13. [GenAI Collaboration](#13-genai-collaboration)
 14. [Future Considerations](#14-future-considerations)
+15. [CI/CD Pipeline](#15-cicd-pipeline)
 
 ---
 
@@ -79,11 +80,13 @@ The following assumptions were made where requirements were ambiguous. Each assu
 C4Context
     title System Context — Unified Service Scheduler
 
-    Person(customer, "Customer / Service Advisor", "Books a vehicle service appointment via API")
-    System(scheduler, "Unified Service Scheduler", "Flask REST API that checks resource availability and confirms appointments")
+    Person(customer, "Service Advisor", "Uses the booking UI to schedule service appointments")
+    System(frontend, "React Booking Frontend", "Web-based UI for searching customers, selecting vehicles, viewing recent appointment history, and confirming time slots")
+    System(scheduler, "Unified Service Scheduler", "Flask REST API that checks resource availability, enforces booking constraints, and confirms appointments")
     SystemDb(db, "PostgreSQL Database", "Persists customers, vehicles, appointments, technicians, bays, and schedules")
 
-    Rel(customer, scheduler, "HTTPS REST requests", "JSON / cURL / OpenAPI")
+    Rel(customer, frontend, "Web browser", "HTTPS")
+    Rel(frontend, scheduler, "REST API calls", "JSON / HTTPS")
     Rel(scheduler, db, "SQL queries via SQLAlchemy ORM", "TCP / pg driver")
 ```
 
@@ -93,272 +96,19 @@ C4Context
 C4Container
     title Container Diagram — Unified Service Scheduler
 
-    Person(client, "API Client", "cURL, Postman, or any HTTP client")
+    Person(advisor, "Service Advisor", "Uses the booking application")
 
-    Container(api, "Flask REST API", "Python / Flask", "Receives HTTP requests, validates input, routes to service layer")
-    Container(service, "Service Layer", "Python modules", "Enforces business rules, orchestrates availability checks, builds appointment records")
-    Container(repo, "Repository Layer", "Python / SQLAlchemy", "Abstracts all database access; provides query methods to the service layer")
-    ContainerDb(pg, "PostgreSQL 15", "Relational Database", "Source of truth for all domain data and appointment state")
+    Container(frontend, "React Booking Frontend", "TypeScript / React", "Interactive UI for customer search, vehicle selection with recent appointment history, service type selection, calendar browsing, and booking confirmation. Displays up to 3 most recent appointments per vehicle to inform advisor decisions.")
+    Container(api, "Flask REST API", "Python / Flask", "Receives HTTP requests, validates input, routes to service layer. GET /customers?include=vehicles endpoint batch-fetches and attaches recent_appointments array to each vehicle.")
+    Container(service, "Service Layer", "Python modules", "Enforces business rules, orchestrates availability checks, builds appointment records. AvailabilityService performs in-memory slot generation after batch-loading booked intervals.")
+    Container(repo, "Repository Layer", "Python / SQLAlchemy", "Abstracts all database access. AppointmentRepository uses ROW_NUMBER() window function to efficiently fetch top-3 CONFIRMED appointments per vehicle in single batch query, avoiding N+1 problem.")
+    ContainerDb(pg, "PostgreSQL 15", "Relational Database", "Source of truth for all domain data and appointment state. Stores appointments with status (PENDING/CONFIRMED/CANCELLED/COMPLETED/EXPIRED) and advisory locks for atomicity.")
 
-    Rel(client, api, "HTTP/JSON", "REST")
+    Rel(advisor, frontend, "Web browser interaction")
+    Rel(frontend, api, "REST API calls (search, availability, booking)", "HTTPS / JSON")
     Rel(api, service, "Python function calls")
     Rel(service, repo, "Python function calls")
-    Rel(repo, pg, "SQLAlchemy ORM / raw SQL")
-```
-
-### 3.3 Full Booking Flow (Sequence)
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Client (cURL)
-    participant R as Flask Route
-    participant DS as DealershipService
-    participant CS as CustomerService
-    participant VS as VehicleService
-    participant AS as AvailabilityService
-    participant S as AppointmentService
-    participant DR as DealershipRepository
-    participant CR as CustomerRepository
-    participant VR as VehicleRepository
-    participant STR as ServiceTypeRepository
-    participant TR as TechnicianRepository
-    participant BR as BayRepository
-    participant AR as AppointmentRepository
-    participant DB as PostgreSQL
-
-    Note over C,DB: STEP 0 — Select Dealership
-    C->>R: GET /dealerships?q=metro
-    R->>DS: search_by_name(q)
-    DS->>DR: search_by_name(q)
-    DR->>DB: SELECT dealerships WHERE name ILIKE ?
-    DB-->>DR: List[Dealership]
-    DR-->>DS: List[Dealership]
-    DS-->>R: List[Dealership]
-    R-->>C: 200 OK { data: [{ id, name, city, state, timezone }] }
-
-    Note over C,DB: STEP 0a — Find or Register Customer
-    C->>R: GET /customers?q=smith
-    R->>CS: search_any(q)
-    CS->>CR: search_by_any(q)
-    CR->>DB: SELECT customers WHERE first_name/last_name/phone ILIKE ?
-    DB-->>CR: List[Customer]
-
-    alt Customer(s) found → load profile + vehicles in one call
-        CR-->>CS: List[Customer]
-        CS-->>R: List[Customer]
-        R-->>C: 200 OK { data: [{ id, first_name, last_name, email, phone }] } (advisor picks correct one if multiple)
-        C->>R: GET /customers/{customer_id}?include=vehicles
-        R->>CS: get_by_id(customer_id)
-        CS->>CR: get_by_id(customer_id)
-        CR->>DB: SELECT customers WHERE id = ?
-        DB-->>CR: Customer
-        CR-->>CS: Customer
-        CS-->>R: Customer
-        Note over R: include=vehicles → VehicleService.list_by_customer()
-        R->>VS: list_by_customer(customer_id)
-        VS->>VR: list_by_customer(customer_id)
-        VR->>DB: SELECT vehicles WHERE id IN (owned WHERE customer_id=? UNION booked-on-behalf WHERE vehicle_id IN appts) ORDER BY created_at ASC
-        DB-->>VR: [Vehicle, ...]
-        VR-->>VS: list
-        VS-->>R: list
-        Note over R: Batch-fetch top-3 CONFIRMED appts per vehicle via ROW_NUMBER()<br/>Attach as recent_appointments[] to each vehicle in response
-        R-->>C: 200 OK { customer: { ...fields, vehicles: [{ ...fields, recent_appointments: [...] }] } }
-        Note over C: vehicles[] drives Step 0b decision tree<br/>(0 → register new, 1 → auto-select, >1 → show picker)
-        opt Info outdated → update
-            C->>R: PATCH /customers/{customer_id} { phone, address, ... }
-            R->>CS: update_customer(id, data)
-            CS->>CR: update(id, data)
-            CR->>DB: UPDATE customers SET ... WHERE id = ?
-            DB-->>CR: Customer
-            CR-->>CS: Customer
-            CS-->>R: Customer (+ warning if duplicate phone)
-            R-->>C: 200 OK { customer, warning? }
-        end
-    else Customer not found → register new
-        CR-->>CS: None
-        CS-->>R: None
-        R-->>C: 200 OK { data: [] }
-        C->>R: POST /customers { first_name, last_name, email, phone, address? }
-        R->>CS: create_customer(data)
-        CS->>CR: insert(customer)
-        CR->>DB: INSERT INTO customers
-        DB-->>CR: Customer
-        CR-->>CS: Customer
-        CS-->>R: Customer (+ warning if duplicate phone)
-        R-->>C: 201 Created { customer, warning? }
-        Note over C: New customer has no vehicles → go straight to register vehicle form
-    end
-
-    Note over C,DB: STEP 0b — Select or Register Vehicle (vehicles[] already loaded above)
-
-    alt Customer has existing vehicles (vehicles.length > 0)
-        Note over C: UI shows picker:<br/>"Use existing vehicle" list + "Register new vehicle" option<br/>Each vehicle shows last 3 CONFIRMED appointments (service type, date, technician, booked_by)
-        alt Advisor selects an existing vehicle
-            Note over C: Vehicle id already known — skip lookup
-            opt Advisor searches by VIN or V-XXXXXX (vehicle not in list)
-                C->>R: GET /vehicles/{VIN | V-XXXXXX}
-                R->>VS: get_by_identifier(identifier)
-                VS->>VR: get_by_vin or get_by_vehicle_number
-                VR->>DB: SELECT vehicles WHERE vin=? OR vehicle_number=?
-                DB-->>VR: Vehicle or None
-                VR-->>VS: Vehicle or NotFoundError
-                VS-->>R: Vehicle or NotFoundError
-                R-->>C: 200 OK { vehicle } or 404 Not Found
-            end
-            opt Info outdated (e.g. make/model/year)
-                C->>R: PATCH /vehicles/{vehicle_id} { make, model, year }
-                R->>VS: update(vehicle_id, data)
-                VS->>VR: update(vehicle, data)
-                VR->>DB: UPDATE vehicles SET ... WHERE id = ?
-                DB-->>VR: Vehicle
-                VR-->>VS: Vehicle
-                VS-->>R: Vehicle
-                R-->>C: 200 OK { vehicle }
-            end
-        else Advisor registers a new vehicle
-            C->>R: POST /vehicles { customer_id, vin?, make, model, year }
-            R->>VS: create(data)
-            VS->>VR: create(...)
-            VR->>DB: INSERT INTO vehicles
-            DB-->>VR: Vehicle (vehicle_number auto-assigned if no VIN)
-            VR-->>VS: Vehicle
-            VS-->>R: Vehicle
-            R-->>C: 201 Created { vehicle }
-        end
-    else Customer has no vehicles (total = 0)
-        Note over C: UI goes straight to "Register new vehicle" form
-        opt Advisor knows VIN / V-XXXXXX ref — look up first
-            C->>R: GET /vehicles/{VIN | ID | V-XXXXXX}
-            R->>VS: get_by_identifier(identifier)
-            Note over VS: numeric → get_by_id<br/>17-char VIN → get_by_vin<br/>V-XXXXXX → get_by_vehicle_number<br/>other → 400
-            VS->>VR: appropriate lookup
-            VR->>DB: SELECT vehicles WHERE ...
-            DB-->>VR: Vehicle or None
-            VR-->>VS: Vehicle or None
-            VS-->>R: Vehicle or NotFoundError
-            R-->>C: 200 OK { vehicle } or 404 Not Found
-        end
-        C->>R: POST /vehicles { customer_id, vin?, make, model, year }
-        R->>VS: create(data)
-        VS->>VR: create(...)
-        VR->>DB: INSERT INTO vehicles
-        DB-->>VR: Vehicle
-        VR-->>VS: Vehicle
-        VS-->>R: Vehicle
-        R-->>C: 201 Created { vehicle }
-    end
-
-    Note over C,DB: STEP 0c — Select Service Type
-    C->>R: GET /service-types
-    R->>STR: list_all()
-    STR->>DB: SELECT * FROM service_types
-    DB-->>STR: List[ServiceType]
-    STR-->>R: List[ServiceType]
-    R-->>C: 200 OK { data: [ { id, name, description, duration_minutes, required_bay_type } ] }
-
-    Note over C,DB: STEP 0c.5 — Select Technician (Optional)
-    opt Advisor or customer requests a specific technician
-        C->>R: GET /dealerships/{dealership_id}/technicians?service_type_id=
-        R->>AS: list_qualified_technicians(dealership_id, service_type_id)
-        AS->>TR: list_qualified(dealership_id, service_type_id)
-        TR->>DB: SELECT technicians WHERE qualified AND active
-        DB-->>TR: List[Technician]
-        TR-->>AS: List[Technician]
-        AS-->>R: List[Technician]
-        R-->>C: 200 OK { data: [{ id, name, employee_number }] }
-        Note over C: Advisor picks preferred technician → technician_id held client-side
-    end
-
-    Note over C,DB: STEP 0d-1 — Calendar View (Browse Available Slots)
-    C->>R: GET /dealerships/{dealership_id}/availability?service_type_id=&from_date=&days=15[&technician_id=]
-    R->>AS: get_calendar_slots(dealership_id, service_type_id, from_date, days, technician_id?)
-    Note over AS,TR,BR,AR: Load all data for full date range upfront — 3 queries total
-    AS->>TR: load_qualified_technicians(dealership_id, service_type_id, technician_id?)
-    TR->>DB: SELECT technicians WHERE qualified AND active [AND id = :technician_id]
-    DB-->>TR: List[Technician]
-    TR-->>AS: List[Technician]
-    AS->>BR: load_compatible_bays(dealership_id, bay_type)
-    BR->>DB: SELECT service_bays WHERE bay_type = ? AND active
-    DB-->>BR: List[Bay]
-    BR-->>AS: List[Bay]
-    AS->>AR: load_booked_intervals(dealership_id, from_date, to_date)
-    AR->>DB: SELECT technician_id, service_bay_id, scheduled_start, scheduled_end WHERE CONFIRMED in range
-    DB-->>AR: List[Interval]
-    AR-->>AS: booked intervals map { resource_id → [(start, end)] }
-    Note over AS: In-memory slot generation — no further DB calls<br/>For each 30-min slot: check overlap using pre-loaded intervals
-    AS-->>R: slots grouped by date { date, available_times: [{ start, end, technician_count }] }
-    R-->>C: 200 OK { slots: [...], filtered_technician?: { id, name } }
-
-    Note over C,DB: STEP 0d-2 — Spot Check (Confirm Slot + Technician List)
-    C->>R: GET /dealerships/{dealership_id}/availability?service_type_id=&desired_start=[&technician_id=]
-    R->>AS: check_slot(dealership_id, service_type_id, desired_start, technician_id?)
-    AS->>TR: find_available(dealership_id, service_type_id, window_start, window_end, technician_id?)
-    Note over TR,DB: technician_id provided → check only that technician<br/>technician_id omitted  → return all available technicians
-    TR->>DB: SELECT technicians WHERE NOT EXISTS overlapping appointment (NOT EXISTS subquery)
-    DB-->>TR: List[Technician] (1 entry max when filtered)
-    AS->>BR: find_available(dealership_id, bay_type, window_start, window_end)
-    BR->>DB: SELECT bays WHERE NOT EXISTS overlapping appointment (NOT EXISTS subquery)
-    DB-->>BR: List[Bay]
-    AS-->>R: { available, available_technicians[], bay_available, next_available_slot? }
-    R-->>C: 200 OK { available, available_technicians: [{ id, name, employee_number }], bay_available, next_available_slot? }
-
-    Note over C,DB: STEP 1 — Create PENDING Soft Hold (Phase 2a)
-    C->>R: POST /appointments { customer_id, vehicle_id, dealership_id, service_type_id, desired_start, technician_id? }
-    R->>S: create_appointment(booking_request)
-    S->>STR: get_service_type(service_type_id)
-    STR->>DB: SELECT service_types WHERE id = ?
-    DB-->>STR: ServiceType (duration_minutes, required_bay_type)
-    STR-->>S: ServiceType
-
-    alt technician_id provided by client
-        S->>TR: validate_and_get(technician_id, service_type_id, window_start, window_end)
-        TR->>DB: SELECT technician WHERE qualified AND no overlap (excl. EXPIRED/CANCELLED PENDING)
-        DB-->>TR: Technician or None
-    else technician_id omitted — auto-assign (least-loaded-today)
-        S->>TR: find_least_loaded_available(dealership_id, service_type_id, window_start, window_end)
-        TR->>DB: SELECT technician WHERE qualified AND no overlap ORDER BY bookings_today ASC LIMIT 1
-        DB-->>TR: Technician or None
-    end
-
-    S->>BR: find_available_bay(dealership_id, bay_type, window_start, window_end)
-    BR->>DB: SELECT first bay WHERE compatible AND no overlap
-    DB-->>BR: ServiceBay or None
-
-    alt Both technician AND bay available
-        S->>AR: create_pending(...)
-        AR->>DB: SELECT pg_advisory_xact_lock(hashtext('tech:{technician_id}:{booking_date}'))
-        AR->>DB: SELECT pg_advisory_xact_lock(hashtext('bay:{service_bay_id}:{booking_date}'))
-        AR->>DB: INSERT INTO appointments (status=PENDING, expires_at=now+10min)
-        DB-->>AR: Appointment
-        AR-->>S: Appointment (PENDING)
-        S-->>R: Appointment DTO
-        R-->>C: 202 Accepted { appointment: { id, status: PENDING, expires_at, technician, service_bay, ... } }
-    else Resource unavailable (race condition edge case)
-        S->>AS: find_next_slot(dealership_id, service_type_id, desired_start)
-        AS-->>S: next_available_slot
-        S-->>R: ResourceUnavailableError
-        R-->>C: 409 Conflict { next_available_slot }
-    end
-
-    Note over C,DB: STEP 2 — Confirm Hold (Phase 2b)
-    C->>R: PATCH /appointments/{id}/confirm
-    R->>S: confirm_appointment(id)
-    S->>AR: get_by_id(id)
-    AR->>DB: SELECT appointments WHERE id = ?
-    DB-->>AR: Appointment
-    AR-->>S: Appointment
-    alt Hold still valid (expires_at > now AND status = PENDING)
-        S->>AR: confirm(appointment)
-        AR->>DB: UPDATE appointments SET status=CONFIRMED, expires_at=NULL WHERE id=?
-        DB-->>AR: Appointment
-        AR-->>S: Appointment (CONFIRMED)
-        S-->>R: Appointment DTO
-        R-->>C: 200 OK { appointment: { id, status: CONFIRMED, scheduled_start, scheduled_end, ... } }
-    else Hold expired or already processed
-        S-->>R: HoldExpiredError / InvalidStateError
-        R-->>C: 409 Conflict { error: "Hold expired", next_available_slot }
-    end
+    Rel(repo, pg, "SQLAlchemy ORM / raw SQL / advisory locks")
 ```
 
 ---
@@ -400,16 +150,6 @@ The route layer contains no business logic. It is intentionally thin.
 | `GET` | `/openapi.json` | OpenAPI 3.1 specification (machine-readable) |
 | `GET` | `/swagger-ui` | Swagger UI (interactive API documentation browser) |
 | `GET` | `/health` | Health check endpoint |
-
-**Planned — Future Releases**
-
-| Method | Path | Description | Priority |
-|--------|------|-------------|----------|
-| `GET` | `/appointments` | List appointments by date / dealership | Medium |
-| `GET` | `/appointments/{appointment_id}` | Retrieve appointment details | Medium |
-| `POST` | `/appointments/{appointment_id}/reschedule` | Reschedule (cancel + rebook in one call) | Medium |
-| `PATCH` | `/vehicles/{vehicle_id}/vin` | Assign or update VIN on an existing vehicle | Medium |
-| `GET` | `/technicians` | Global unscoped technician list (cross-dealership admin use) | Low |
 
 ---
 
@@ -592,7 +332,7 @@ erDiagram
 
 Two additional identifier fields beyond the primary key:
 - **`vin`** (optional, unique) — 17-character Vehicle Identification Number. `POST /vehicles` with an existing VIN returns `409` with the existing record. `null` for vehicles registered without a VIN.
-- **`vehicle_number`** (optional, unique, BigInteger) — auto-assigned only when `vin` is `null`. Provides a short human-readable surrogate reference encoded as `"V-000001"` (zero-padded 6-digit, `V-` prefix). `null` for vehicles that have a VIN. A BigInt index (8 bytes) is significantly faster than a string-based index for this supplementary lookup path.
+- **`vehicle_number`** (optional, unique, BigInteger) — auto-assigned only when `vin` is `null`. Provides a short human-readable surrogate reference encoded as `"VH-000001"` (zero-padded 6-digit, `VH-` prefix). `null` for vehicles that have a VIN. A BigInt index (8 bytes) is significantly faster than a string-based index for this supplementary lookup path.
 
 **Dealership** — A physical service location. Owns a pool of technicians and service bays. Stores a timezone string to correctly interpret business hours.
 
@@ -939,8 +679,8 @@ Slots that fail either condition are **excluded entirely** — the advisor only 
     {
       "date": "2026-03-20",
       "available_times": [
-        { "start": "2026-03-20T09:00:00", "end": "2026-03-20T10:30:00", "technician_count": 1 },
-        { "start": "2026-03-20T11:00:00", "end": "2026-03-20T12:30:00", "technician_count": 1 }
+        { "start": "2026-03-20T09:00:00", "end": "2026-03-20T10:30:00", "technician_count": 1, "bay_count": 2 },
+        { "start": "2026-03-20T11:00:00", "end": "2026-03-20T12:30:00", "technician_count": 1, "bay_count": 1 }
       ]
     },
     {
@@ -1679,7 +1419,8 @@ List or search service types by name. Supports typeahead so the advisor can quic
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `q` | string | No | Partial name search (min 2 chars). Matches against `name` and `description`. |
-| `limit` | integer | No | Max results (default: 20, max: 50). Ignored when `q` is omitted. |
+| `limit` | integer | No | Max results per page (default: 20) |
+| `cursor` | string | No | Opaque cursor for next page (from previous response `next_cursor`) |
 
 **Examples:**
 ```bash
@@ -1708,7 +1449,8 @@ GET /service-types?q=brake
       "duration_minutes": 120,
       "required_bay_type": "LIFT"
     }
-  ]
+  ],
+  "next_cursor": null
 }
 ```
 
@@ -1730,7 +1472,8 @@ Typeahead search for dealerships by name. Called at the start of the booking flo
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `q` | string | No | Partial name search (min 2 chars). If omitted, returns all dealerships. |
-| `limit` | integer | No | Max results (default: 10, max: 20) |
+| `limit` | integer | No | Max results per page (default: 10) |
+| `cursor` | string | No | Opaque cursor for next page (from previous response `next_cursor`) |
 
 **Example:**
 ```bash
@@ -1743,7 +1486,8 @@ GET /dealerships?q=metro&limit=10
   "data": [
     { "id": "C-000001", "name": "Metro Honda Service Center", "city": "Austin", "state": "TX", "timezone": "America/Chicago" },
     { "id": "C-000001", "name": "Metro Toyota",               "city": "Austin", "state": "TX", "timezone": "America/Chicago" }
-  ]
+  ],
+  "next_cursor": null
 }
 ```
 
@@ -1806,14 +1550,14 @@ GET /dealerships/1/availability
     {
       "date": "2026-03-20",
       "available_times": [
-        { "start": "2026-03-20T09:00:00", "end": "2026-03-20T10:30:00", "technician_count": 2 },
-        { "start": "2026-03-20T11:00:00", "end": "2026-03-20T12:30:00", "technician_count": 1 }
+        { "start": "2026-03-20T09:00:00", "end": "2026-03-20T10:30:00", "technician_count": 2, "bay_count": 3 },
+        { "start": "2026-03-20T11:00:00", "end": "2026-03-20T12:30:00", "technician_count": 1, "bay_count": 2 }
       ]
     },
     {
       "date": "2026-03-21",
       "available_times": [
-        { "start": "2026-03-21T09:00:00", "end": "2026-03-21T10:30:00", "technician_count": 3 }
+        { "start": "2026-03-21T09:00:00", "end": "2026-03-21T10:30:00", "technician_count": 3, "bay_count": 3 }
       ]
     },
     {
@@ -1835,7 +1579,7 @@ GET /dealerships/1/availability
     {
       "date": "2026-03-20",
       "available_times": [
-        { "start": "2026-03-20T09:00:00", "end": "2026-03-20T10:30:00", "technician_count": 1 }
+        { "start": "2026-03-20T09:00:00", "end": "2026-03-20T10:30:00", "technician_count": 1, "bay_count": 2 }
       ]
     },
     {
@@ -1847,7 +1591,8 @@ GET /dealerships/1/availability
 ```
 
 > `technician_count` is always 0 or 1 when `technician_id` is provided (that specific technician's status). Slots where Carlos is busy are excluded, even if other technicians are free.
-> `technician_count` is returned instead of technician names to keep the calendar response lightweight. Full technician list is returned in Spot Check mode after the user picks a slot.
+> `bay_count` reflects the number of compatible bays free for that slot — useful for the UI to indicate remaining capacity.
+> `technician_count` and `bay_count` are returned instead of names to keep the calendar response lightweight. Full technician list is returned in Spot Check mode after the user picks a slot.
 > Days with `available_times: []` are shown explicitly so the calendar can mark them as fully booked.
 
 ---
@@ -2789,46 +2534,28 @@ with primary_engine.begin() as conn:          # primary
 
 ### 13.1 How AI Was Used in the Design Phase
 
-This document was produced through iterative collaboration with Claude (Anthropic), used as a design thinking partner and documentation accelerator.
+The collaboration followed a clear human-led loop throughout the entire project:
 
----
+**AI's role — implement and propose:**
+- Translated requirements and design decisions into working code (models, repositories, services, routes, schemas, tests, Docker config, frontend components)
+- Proposed approaches for non-trivial problems (advisory lock strategy, two-phase booking, batch availability queries, window function for top-N appointments)
+- Wrote first drafts of this design document based on decisions already made by the human
 
-**Domain Modeling**
+**Human's role — decide, review, and validate:**
+- Made all architectural decisions (tech stack, data model, locking strategy, API contract)
+- Reviewed every piece of code and document produced by AI before accepting it
+- Ran and tested the system locally — executed the test suite, observed actual runtime behaviour, identified failures the AI could not see
+- Corrected AI when output was wrong or did not match real requirements ("stop", "that's not what I want", "change X to Y")
+- Determined scope — what to build, what to defer, what to remove
 
-The initial entity list was sketched by the human designer. The AI was prompted: *"Given this entity list for a dealership booking system, what relationships and attributes are likely missing?"*
+**Concrete examples of human correction overriding AI output:**
+- AI initially implemented vehicle ownership transfer when a customer selected another customer's car — human stopped this and reframed the problem: "booking on behalf of" should show the vehicle in history without changing ownership
+- AI added expired PENDING status display to the UI — human decided to filter to CONFIRMED only, keeping the history clean
+- AI proposed UUID primary keys — human decided on BigInteger for query performance
 
-AI contributions accepted after review:
-- `TechnicianQualification` join table (many-to-many with `certified_at` audit timestamp) rather than a simple list field on `Technician`.
-- `required_bay_type` on `ServiceType` (not on `Appointment`) — correctly placing the constraint on the service definition.
-- `timezone` on `Dealership` for multi-timezone chain support.
+The AI never ran the code, never saw actual error output directly, and never made product decisions. All validation happened through the human running the system and reporting results back.
 
----
 
-**Availability Algorithm Design**
-
-The human described the dual-resource constraint. The AI was asked: *"What are the failure modes of a naive check-then-insert approach?"*
-
-AI identified the TOCTOU race condition and suggested the advisory lock pattern. The `EXCLUDE USING gist` alternative was surfaced as a future hardening option (the human chose not to include it in v1 to avoid the `btree_gist` extension dependency).
-
----
-
-**Index Strategy**
-
-The AI was given the availability query shapes and suggested the partial index pattern (originally `WHERE status = 'CONFIRMED'`), verified against PostgreSQL documentation before inclusion. When PENDING soft holds were introduced in v1.3, the index condition was updated to `WHERE status IN ('CONFIRMED', 'PENDING')` — see §13.2 Index Strategy Update.
-
----
-
-**Observability**
-
-The AI proposed specific metric names and explained why high-cardinality labels (e.g., `appointment_id`) must be excluded from Prometheus metrics. The `appointment_id` label was explicitly removed from all metric definitions as a result.
-
----
-
-**Index Strategy Update (v1.3 — PENDING soft hold)**
-
-When the PENDING status was added, the AI was asked to review the impact on existing partial indexes. It correctly identified that `WHERE status = 'CONFIRMED'` indexes would miss PENDING rows, causing the availability overlap check to return false positives (showing a slot as free when a live PENDING hold exists). Indexes were updated to `WHERE status IN ('CONFIRMED', 'PENDING')` and a dedicated `idx_appointments_pending_expires` index was added for efficient TTL cleanup queries.
-
----
 
 ### 13.2 AI-Assisted Design Review — Issues Found and Resolved
 
@@ -2992,6 +2719,133 @@ Automated deployment is not implemented in v1 but is planned. The intended appro
 | Deploy to production | Manual approval gate or auto on staging pass | After staging green |
 
 The multi-stage Dockerfile (`builder` → `runtime` / `test`) is already structured to support this — the `runtime` stage produces a minimal production image with no test dependencies.
+
+---
+
+## 16. Scaling Roadmap: Architecture Evolution
+
+The system is designed to scale from thousands to hundreds of thousands of concurrent users through infrastructure evolution and optimization. Two scaling phases define the architectural changes needed.
+
+---
+
+### 16.0 Core Scaling Principles
+
+Before adding infrastructure, three architectural ideas drive every decision below:
+
+#### Read/Write Path Separation
+
+Calendar browsing (read) and booking creation (write) have very different characteristics:
+
+```
+Read path  (GET /availability):
+  - High volume, 10–100× more frequent than writes
+  - Slightly stale data is acceptable (30s TTL is fine)
+  - Can be served from replica or cache
+
+Write path (POST /appointments):
+  - Low volume but must be strongly consistent
+  - Requires advisory lock + re-check → always hits primary
+  - Must never serve stale data
+```
+
+Separating these paths means reads never compete with writes for DB connections, and write latency stays predictable regardless of read traffic spikes.
+
+```
+Client
+  │
+  ├── GET /availability ──▶ Redis cache (hit: <5ms)
+  │                              │ miss
+  │                              ▼
+  │                         PostgreSQL REPLICA
+  │
+  └── POST /appointments ──▶ PostgreSQL PRIMARY (advisory lock → INSERT)
+```
+
+#### Hot Data in Redis, Cold Data in PostgreSQL
+
+Most data accessed during a booking flow is **hot** (same dealerships, same service types, same technician list queried thousands of times per day) and can live entirely in Redis:
+
+| Data | Storage | TTL | Reason |
+|------|---------|-----|--------|
+| Calendar slots (`avail:{dealership}:{date}`) | Redis | 30s | Invalidated on every confirmed booking/cancel |
+| Technician list per dealership+service | Redis | 5 min | Changes rarely (new hires, qualification updates) |
+| Service type catalog | Redis | 10 min | Almost never changes |
+| Dealership info (name, timezone) | Redis | 1 hour | Static config |
+| Customer profile | PostgreSQL only | — | PII — not cached |
+| Appointment records | PostgreSQL only | — | Source of truth, audit trail |
+
+The key insight: **only the booking INSERT itself needs PostgreSQL**. Everything the advisor sees before clicking "Confirm" can come from Redis. At high load, this means 90–95% of requests never touch the DB primary.
+
+#### Invalidation strategy
+
+```
+POST /appointments confirmed
+  → delete Redis key avail:{dealership_id}:{local_date}
+  → next GET /availability repopulates from DB replica
+
+PATCH /appointments cancel
+  → same invalidation
+```
+
+Simple delete-on-write (not update-in-place) avoids cache stampede races. The 30s TTL is a safety net if invalidation fails.
+
+---
+
+---
+
+### 16.1 Scaling Strategy
+
+Scale in order of complexity — exhaust cheap options before adding infrastructure.
+
+#### Step 1 — Vertical Scaling (no code changes)
+
+| Component | Current | Scale up |
+|-----------|---------|----------|
+| Flask/Gunicorn | 4 workers | Increase `GUNICORN_WORKERS` = (2 × CPU cores) + 1 |
+| PostgreSQL | Single node | Add RAM/CPU — doubling RAM roughly doubles buffer cache hit rate |
+| Redis | Single node | Increase instance size to keep more hot data in memory |
+
+Bottlenecks appear in this order:
+
+```
+1. Flask workers saturate (CPU > 80%)
+   → increase GUNICORN_WORKERS or upgrade CPU
+
+2. PostgreSQL connection pool exhausted
+   → add PgBouncer in front of DB
+
+3. PostgreSQL primary overloaded (reads + writes on same node)
+   → add read replica; route GET /availability to replica
+```
+
+#### Step 2 — Horizontal Scaling (when vertical hits its limit)
+
+Once the largest cost-effective instance is still not enough, scale out:
+
+- **Flask/Gunicorn** — stateless by design; add containers behind a load balancer (nginx upstream or cloud LB). No code changes required. Cloud auto-scaling (AWS ECS, Kubernetes HPA) can spin up/down replicas based on CPU or request queue depth.
+- **PostgreSQL** — primary handles writes; read replicas handle availability queries. PgBouncer pools connections on each node.
+- **Redis** — single node is typically sufficient; promote to cluster mode only when memory exceeds the largest single instance.
+
+```
+                    ┌─────────────────────────────┐
+Internet ──► LB ──► │  Flask  │  Flask  │  Flask  │  (auto-scaled)
+                    └────────────────┬────────────┘
+                                     │
+                    ┌────────────────▼────────────┐
+                    │  PgBouncer                  │
+                    └──────┬──────────────┬───────┘
+                           │              │
+                    ┌──────▼──────┐  ┌────▼────────┐
+                    │  PG Primary │  │ PG Replica  │
+                    │  (writes)   │  │  (reads)    │
+                    └─────────────┘  └─────────────┘
+```
+
+#### When to move to Step 2
+
+- Flask p95 latency > 200 ms sustained after vertical upgrade
+- PostgreSQL primary CPU > 85% sustained
+- Connection pool queue depth consistently > 20
 
 ---
 
