@@ -2585,6 +2585,56 @@ Traces export to a configured OTLP collector (Jaeger, Tempo, or Datadog APM). `r
 
 ## 12. Deployment & Scalability
 
+### 12.0 Docker Compose — Local / Demo Stack
+
+The full stack runs as three containers orchestrated by a single `docker-compose.yml` at the project root:
+
+```
+Browser
+  │
+  │  http://localhost:3000
+  ▼
+┌─────────────────────────────────┐
+│  frontend  (nginx:alpine)        │  port 3000:80
+│                                 │
+│  - Serves React SPA (static)    │
+│  - Proxies /api/* → backend:5000│
+└────────────────┬────────────────┘
+                 │  http://backend:5000  (Docker internal network)
+                 ▼
+┌─────────────────────────────────┐
+│  backend  (python:3.12-slim)    │  port 5001:5000 (host:container)
+│                                 │
+│  - Gunicorn (4 workers)         │
+│  - Flask app                    │
+│  - Runs alembic migrate on boot │
+└────────────────┬────────────────┘
+                 │  postgresql://db:5432/scheduler_db
+                 ▼
+┌─────────────────────────────────┐
+│  db  (postgres:15-alpine)       │  port 5432:5432
+│                                 │
+│  - scheduler_db (app data)      │
+│  - scheduler_test (CI tests)    │
+└─────────────────────────────────┘
+```
+
+**Request flow (booking):**
+1. Advisor opens `http://localhost:3000` → nginx serves `index.html` + React JS bundle
+2. React calls `POST /api/appointments` → nginx strips `/api` prefix, proxies to `http://backend:5000/appointments`
+3. Flask route → `AppointmentService` → advisory lock + INSERT → PostgreSQL
+4. Response travels back: PostgreSQL → Flask → nginx → browser
+
+**Why nginx in front of Flask?**
+Gunicorn is a pure WSGI server — it handles Python but is not optimised for serving static files or handling slow clients. nginx buffers slow client connections so Gunicorn workers are never blocked waiting for a slow browser to receive bytes. In this setup nginx also handles the `/api` → Flask proxy, eliminating CORS entirely.
+
+**Startup order** (enforced by `depends_on: condition: service_healthy`):
+```
+db (healthy) → backend (migrate + start) → frontend (start)
+```
+
+---
+
 ### 12.1 Single-Node Baseline
 
 For development and small deployments the stack runs as a single Docker Compose service:
