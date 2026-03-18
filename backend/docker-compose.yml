@@ -1,0 +1,99 @@
+services:
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: scheduler
+      POSTGRES_PASSWORD: scheduler
+      POSTGRES_DB: scheduler_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scheduler -d scheduler_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      FLASK_APP: run.py
+      FLASK_ENV: development
+      DATABASE_URL: postgresql://scheduler:scheduler@db:5432/scheduler_db
+      SECRET_KEY: dev-secret-change-in-production
+      SKIP_ADVISORY_LOCKS: "false"
+      GUNICORN_WORKERS: "4"
+      GUNICORN_BIND: "0.0.0.0:5000"
+      # Set SEED_DB=true on first run to populate demo data
+      SEED_DB: "false"
+    ports:
+      - "5000:5000"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      # Mount source for hot-reload in dev (comment out for production build)
+      - .:/app
+
+  # ── Test runner: SQLite (no Postgres needed) ────────────────────────────────
+  # Usage:  docker compose run --rm test
+  # Runs all tests instantly against SQLite in-memory (exclude some test cases for PostgreSQL only).
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test        # uses Stage 3 (test stage)
+    environment:
+      FLASK_APP: run.py
+      SECRET_KEY: test-secret
+      # No TEST_DATABASE_URL → SQLite mode, advisory lock tests auto-skipped
+    profiles:
+      - test
+
+  # ── Test runner: PostgreSQL (includes advisory lock tests) ──────────────────
+  # Usage:  docker compose run --rm test-pg
+  # Creates scheduler_test DB, runs alembic, then runs all tests.
+  test-pg:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test
+    environment:
+      FLASK_APP: run.py
+      SECRET_KEY: test-secret
+      TEST_DATABASE_URL: postgresql://scheduler:scheduler@db:5432/scheduler_test
+      PGHOST: db
+      PGUSER: scheduler
+      PGPASSWORD: scheduler
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint: ["sh", "entrypoint.test.sh"]
+    profiles:
+      - test-pg
+
+  # ── One-shot service to run seed data (docker compose run seeder) ───────────
+  seeder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      FLASK_APP: run.py
+      DATABASE_URL: postgresql://scheduler:scheduler@db:5432/scheduler_db
+      SECRET_KEY: dev-secret
+      SKIP_ADVISORY_LOCKS: "false"
+      SEED_DB: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint: ["sh", "-c", "alembic upgrade head && flask seed-db"]
+    profiles:
+      - seed
+
+volumes:
+  postgres_data:
