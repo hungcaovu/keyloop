@@ -214,9 +214,9 @@ sequenceDiagram
     else Customer has no vehicles (total = 0)
         Note over C: UI goes straight to "Register new vehicle" form
         opt Advisor knows VIN / V-XXXXXX ref — look up first
-            C->>R: GET /vehicles/{VIN | UUID | V-XXXXXX}
+            C->>R: GET /vehicles/{VIN | ID | V-XXXXXX}
             R->>VS: get_by_identifier(identifier)
-            Note over VS: UUID → get_by_id<br/>17-char VIN → get_by_vin<br/>V-XXXXXX → get_by_vehicle_number<br/>other → 400
+            Note over VS: numeric → get_by_id<br/>17-char VIN → get_by_vin<br/>V-XXXXXX → get_by_vehicle_number<br/>other → 400
             VS->>VR: appropriate lookup
             VR->>DB: SELECT vehicles WHERE ...
             DB-->>VR: Vehicle or None
@@ -358,7 +358,7 @@ The route layer contains no business logic. It is intentionally thin.
 | `GET` | `/customers/{customer_id}` | Get full customer profile. `?include=vehicles` embeds the vehicle list in one call. |
 | `PATCH` | `/customers/{customer_id}` | Update customer info (name, phone, email, address) |
 | `POST` | `/vehicles` | Register a vehicle |
-| `GET` | `/vehicles/{identifier}` | Get vehicle by VIN, UUID, or V-XXXXXX ref (auto-detected) |
+| `GET` | `/vehicles/{identifier}` | Get vehicle by VIN, numeric ID, or V-XXXXXX ref (auto-detected) |
 | `PATCH` | `/vehicles/{vehicle_id}` | Update vehicle info (make, model, year, customer_id) |
 | `GET` | `/service-types` | List / search service types by name (typeahead) |
 | `GET` | `/openapi.json` | OpenAPI 3.1 specification (machine-readable) |
@@ -394,7 +394,7 @@ The business logic core. The service layer is where the domain rules live and is
 
 **`VehicleService`** — vehicle management:
 
-- Lookup by identifier: auto-routes based on format — `get_by_id` (UUID), `get_by_vin` (17-char VIN), or `get_by_vehicle_number` (`V-XXXXXX` reference). Any other format → `400`.
+- Lookup by identifier: auto-routes based on format — `get_by_id` (numeric), `get_by_vin` (17-char VIN), or `get_by_vehicle_number` (`V-XXXXXX` reference). Any other format → `400`.
 - Register new vehicle; return `409` with existing record if VIN already exists. Auto-assigns `vehicle_number` (BigInt) for VIN-less vehicles.
 - Update vehicle fields including ownership transfer (`customer_id`).
 
@@ -445,10 +445,10 @@ The single source of truth. PostgreSQL was chosen over alternatives for its stro
 ```mermaid
 erDiagram
     CUSTOMER {
-        uuid id PK
+        bigint id PK
         string first_name
         string last_name
-        string email UK
+        string email "indexed, not unique"
         string phone
         string address_line1 "nullable"
         string address_line2 "nullable"
@@ -460,8 +460,8 @@ erDiagram
     }
 
     VEHICLE {
-        uuid id PK
-        uuid customer_id FK
+        bigint id PK
+        bigint customer_id FK
         bigint vehicle_number UK "NULL for VIN vehicles; auto-assigned for no-VIN"
         string vin UK "NULL when vehicle registered without VIN"
         string make
@@ -472,7 +472,7 @@ erDiagram
 
     %% Notes:
     %% - phone is indexed but NOT unique (spouses/family may share)
-    %% - email IS unique per customer record
+    %% - email is indexed but NOT unique (family/shared accounts may use same email)
     %% - vehicle.customer_id = current primary owner (not enforced at booking time)
     %% - VIN is unique per physical car; POST with existing VIN returns 409 + existing record
     %% - vehicle_number: BigInt auto-increment for VIN-less vehicles; encoded as "V-000001"
@@ -480,7 +480,7 @@ erDiagram
     %%   8-byte integer index is significantly faster than 36-char UUID string index.
 
     DEALERSHIP {
-        uuid id PK
+        bigint id PK
         string name
         string address
         string city
@@ -489,7 +489,7 @@ erDiagram
     }
 
     SERVICE_TYPE {
-        uuid id PK
+        bigint id PK
         string name
         string description
         int duration_minutes
@@ -497,8 +497,8 @@ erDiagram
     }
 
     TECHNICIAN {
-        uuid id PK
-        uuid dealership_id FK
+        bigint id PK
+        bigint dealership_id FK
         string first_name
         string last_name
         string employee_number UK
@@ -506,28 +506,28 @@ erDiagram
     }
 
     TECHNICIAN_QUALIFICATION {
-        uuid technician_id FK
-        uuid service_type_id FK
+        bigint technician_id FK
+        bigint service_type_id FK
         timestamp certified_at
     }
 
     SERVICE_BAY {
-        uuid id PK
-        uuid dealership_id FK
+        bigint id PK
+        bigint dealership_id FK
         string bay_number
         string bay_type
         bool is_active
     }
 
     APPOINTMENT {
-        uuid id PK
-        uuid customer_id FK
-        uuid booked_by_customer_id FK
-        uuid vehicle_id FK
-        uuid dealership_id FK
-        uuid service_type_id FK
-        uuid technician_id FK
-        uuid service_bay_id FK
+        bigint id PK
+        bigint customer_id FK
+        bigint booked_by_customer_id FK
+        bigint vehicle_id FK
+        bigint dealership_id FK
+        bigint service_type_id FK
+        bigint technician_id FK
+        bigint service_bay_id FK
         timestamp scheduled_start
         timestamp scheduled_end
         string status
